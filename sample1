@@ -1,0 +1,172 @@
+Payroll Event Avro Specification
+1. Overview
+This document proposes a unified Avro schema and supporting conventions for all Payroll events published to Kafka.
+It covers:
+Publishers and consumers
+Kafka headers
+Avro payload schema (envelope)
+Error handling and fail scenarios
+Usage patterns (first-time, SAF/retry, cancel, EOD)
+This schema must be reviewed and approved by the Data Governance team before adoption.
+2. Event Flow
+Publishers
+Event Manager → publishes first-time payroll events
+Recon Manager → publishes SAF retry events and cancel events
+(Optional) EOD job → publishes end-of-day reconciliation/cancel events (can also be part of Recon)
+Consumer
+Processor Service → subscribes to the single Kafka topic and executes workflows based on event type and SAF metadata.
+
+3. Kafka Headers
+Headers are transport/infra metadata only (not business logic).
+| Header                | Purpose                             | Example                                |
+| --------------------- | ----------------------------------- | -------------------------------------- |
+| `x-trace-id`          | End-to-end trace id (UUID)          | `e43a2b3f-7d6a-4c9b-b9c1-7616f09aa5a9` |
+| `x-correlation-id`    | Correlation with upstream system    | `gusto-evt-12345`                      |
+| `x-idempotency-key`   | Prevents duplicates                 | `eventId:entityId:step`                |
+| `x-schema-id/version` | Schema registry reference           | `42` or `v1.0.0`                       |
+| `x-publisher`         | Who published                       | `EVENT_MANAGER`, `RECON_MANAGER`       |
+| `x-origin-service`    | Source service name                 | `event-manager-service`                |
+| `x-retry-attempt`     | Retry count for SAF publish attempt | `3`                                    |
+| `x-saf`               | Boolean flag if SAF replay          | `true`                                 |
+
+
+4. Avro Schema (Envelope)
+{
+  "type": "record",
+  "name": "PayrollEvent",
+  "namespace": "com.chase.ccb.payments.payroll",
+  "doc": "Unified envelope for EventManager (first-time), ReconManager (SAF/cancel), and optional EOD job.",
+  "fields": [
+    { "name": "eventId",      "type": "string", "doc": "UUID for this message" },
+    { "name": "timestamp",    "type": "long",   "doc": "Epoch millis" },
+    { "name": "eventType",    "type": "string", "doc": "payroll.processed | payroll.saf.retry | payroll.cancel.request | payroll.eod" },
+    { "name": "entityType",   "type": "string", "doc": "Payroll | Employee | Contractor" },
+    { "name": "entityId",     "type": "string", "doc": "Domain entity UUID (e.g. payroll UUID)" },
+    { "name": "resourceType", "type": "string", "doc": "Logical resource (Company, Employee, Account)" },
+    { "name": "resourceId",   "type": "string", "doc": "UUID of resource (e.g. company id)" },
+    {
+      "name": "publisherType",
+      "type": { "type": "enum", "name": "PublisherType", "symbols": ["EVENT_MANAGER","RECON_MANAGER","EOD_JOB"] }
+    },
+    {
+      "name": "saf",
+      "type": ["null", {
+        "type": "record",
+        "name": "SafMetadata",
+        "fields": [
+          { "name": "retryId",       "type": "string", "doc": "Primary key in retry outbox" },
+          { "name": "safMode",       "type": ["null","string"], "default": null, "doc": "BEGINNING | STEP | BEGINNING_SKIP" },
+          { "name": "targetStep",    "type": ["null","string"], "default": null },
+          { "name": "skipUntilStep", "type": ["null","string"], "default": null },
+          { "name": "skipSteps",     "type": { "type":"array","items":"string" }, "default": [] }
+        ]
+      }],
+      "default": null,
+      "doc": "Present only for SAF replays"
+    },
+    {
+      "name": "eod",
+      "type": ["null", {
+        "type": "record",
+        "name": "EodMetadata",
+        "fields": [
+          { "name": "batchId", "type": "string", "doc": "EOD run id" },
+          { "name": "action",  "type": { "type":"enum", "name":"EodAction", "symbols":["RECONCILE","CANCEL","REPORT"] } },
+          { "name": "reason",  "type": ["null","string"], "default": null }
+        ]
+      }],
+      "default": null,
+      "doc": "Present only for EOD driven operations"
+    }
+  ]
+}
+
+5. Event Types
+| `eventType`              | Publisher     | Purpose                                     |
+| ------------------------ | ------------- | ------------------------------------------- |
+| `payroll.processed`      | Event Manager | First-time event received from Gusto        |
+| `payroll.saf.retry`      | Recon Manager | Replay of a failed step                     |
+| `payroll.cancel.request` | Recon Manager | Cancel payroll due to validation/recon diff |
+| `payroll.eod`            | EOD job/Recon | End-of-day reconciliation or cancel         |
+
+6. Example Messages
+First-time (Event Manager)
+
+{
+  "eventId": "acd51ea2-8dd5-4dd4-be91-38a69def787f",
+  "timestamp": 1752694042,
+  "eventType": "payroll.processed",
+  "entityType": "Payroll",
+  "entityId": "4a99c86c-0746-464e-ab35-1451899249c7",
+  "resourceType": "Company",
+  "resourceId": "083136cf-b5f5-4fd0-b9df-f955263b9e33",
+  "publisherType": "EVENT_MANAGER",
+  "saf": null,
+  "eod": null
+}
+SAF Retry (Recon Manager)
+{
+  "eventId": "41c9e55c-cbd8-467c-8759-111e2a61d3d3",
+  "timestamp": 1753013477,
+  "eventType": "payroll.saf.retry",
+  "entityType": "Payroll",
+  "entityId": "4a99c86c-0746-464e-ab35-1451899249c7",
+  "resourceType": "Company",
+  "resourceId": "083136cf-b5f5-4fd0-b9df-f955263b9e33",
+  "publisherType": "RECON_MANAGER",
+  "saf": {
+    "retryId": "PYRL_RTRY_123456",
+    "safMode": "BEGINNING_SKIP",
+    "targetStep": "SendRequestToPIM",
+    "skipUntilStep": null,
+    "skipSteps": ["GeneratePIMIdentifier","PersistPayrollHierarchyToDatabase"]
+  },
+  "eod": null
+}
+SAF Message
+{
+  "eventId": "41c9e55c-cbd8-467c-8759-111e2a61d3d3",
+  "timestamp": 1753013477,
+  "eventType": "payroll.saf.retry",
+  "entityType": "Payroll",
+  "entityId": "4a99c86c-0746-464e-ab35-1451899249c7",
+  "resourceType": "Company",
+  "resourceId": "083136cf-b5f5-4fd0-b9df-f955263b9e33",
+  "publisherType": "RECON_MANAGER",
+  "saf": {
+    "retryId": "PYRL_RTRY_123456",
+    "safMode": "BEGINNING_SKIP",
+    "targetStep": "SendRequestToPIM",
+    "skipUntilStep": null,
+    "skipSteps": ["GeneratePIMIdentifier","PersistPayrollHierarchyToDatabase"]
+  },
+  "eod": null
+}
+Cancel Event (Recon Manager)
+{
+  "eventId": "cxl-41c9e55c-cbd8-467c-8759-111e2a61d3d3",
+  "timestamp": 1753036800000,
+  "eventType": "payroll.cancel.request",
+  "entityType": "Payroll",
+  "entityId": "4a99c86c-0746-464e-ab35-1451899249c7",
+  "resourceType": "Company",
+  "resourceId": "083136cf-b5f5-4fd0-b9df-f955263b9e33",
+  "publisherType": "RECON_MANAGER",
+  "saf": null,
+  "eod": null
+}
+
+7. Fail Scenarios
+| Scenario                              | Handling                                                                                                               |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| **Publish fails (transport)**         | Producer gets exception (e.g. `SerializationException`, `TimeoutException`). Message never in Kafka. Logged + retried. |
+| **Publish succeeds, Processor fails** | Event written to `retry_outbox`. Recon publishes SAF retry later.                                                      |
+| **SAF replay fails repeatedly**       | Recon increments retry count. After max, routed to DLQ or manual review.                                               |
+| **Cancel fails**                      | Processor workflow logs + retries (idempotent).                                                                        |
+
+
+
+8. Responses
+Transport response: Producer gets Kafka RecordMetadata (topic/partition/offset). Not Avro.
+Optional ACK event: Small PayrollAckEvent can be published to an acks topic if we want to explicitly acknowledge acceptance.
+Business outcome events: Processor publishes PayrollOutcomeEvent to payroll.outcomes topic (*_COMPLETED / *_FAILED).
