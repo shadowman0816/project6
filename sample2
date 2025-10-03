@@ -1,0 +1,256 @@
+saf:
+  # optional: strict mode => warn if unknown step names are used in templates
+  strict: true
+
+  # Per entityType
+  groups:
+
+    Payroll:
+      events:
+
+        payroll.processed:
+          # default template when we don't have a specific failed step match
+          defaults:
+            startPolicy: BEGIN            # BEGIN | AT_STEP | BEGIN_WITH_SKIPS
+            enabled: true
+
+          # step-specific overrides keyed by the *failed step name*
+          steps:
+            SendRequestToPIM:
+              startPolicy: BEGIN_WITH_SKIPS
+              skipSteps:
+                - GeneratePIMIdentifier
+                - PersistPayrollHierarchyToDatabase
+
+            GustoDisbursementReconciliationForPayroll:
+              startPolicy: AT_STEP
+              targetStep: GustoDisbursementReconciliationForPayroll
+
+        payroll.cancelled:
+          defaults:
+            startPolicy: AT_STEP
+            targetStep: SendCancellationToPIM
+
+    ContractorPaymentGroup:
+      events:
+        contractor_payment_group.created:
+          defaults:
+            startPolicy: BEGIN
+          steps:
+            SendContractorGroupRequestToPIM:
+              startPolicy: BEGIN_WITH_SKIPS
+              skipSteps:
+                - GenerateContractorPIMIdentifier
+                - PersistPaymentHierarchyToDatabase
+Notes
+	•	startPolicy supports exactly your 3 modes:
+BEGIN, AT_STEP (requires targetStep), BEGIN_WITH_SKIPS (supports skipUntilStep and skipSteps).
+	•	You can set defaults per event and then override per failed step in steps:.
+	•	Add more entityType / eventType blocks as needed.
+
+// package net.jpmchase.payroll.processor.saf.config;
+
+import lombok.*;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Map;
+
+@Component
+@ConfigurationProperties(prefix = "saf")
+@Getter @Setter
+public class SafTemplatesConfig {
+
+  private boolean strict = true;                      // warn if unknown steps
+  private Map<String, Group> groups;                 // entityType -> Group
+
+  @Getter @Setter
+  public static class Group {
+    private Map<String, Event> events;               // eventType -> Event
+  }
+
+  @Getter @Setter
+  public static class Event {
+    private StepTemplate defaults;                   // default policy for event
+    private Map<String, StepTemplate> steps;         // failedStepName -> template
+  }
+
+  @Getter @Setter
+  public static class StepTemplate {
+    private boolean enabled = true;
+    private StartPolicy startPolicy = StartPolicy.BEGIN;
+    private String targetStep;                       // when AT_STEP
+    private String skipUntilStep;                    // optional
+    private List<String> skipSteps;                  // when BEGIN_WITH_SKIPS
+  }
+
+  public enum StartPolicy { BEGIN, AT_STEP, BEGIN_WITH_SKIPS }
+}
+
+// package net.jpmchase.payroll.processor.saf;
+
+import lombok.*;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import java.util.*;
+
+public interface SafTemplateProvider {
+  SafDecision getTemplate(String entityType, String eventType, String failedStep);
+}
+
+@Getter @Builder
+@AllArgsConstructor
+public class SafDecision {
+  private final boolean enabled;
+  private final SafTemplatesConfig.StartPolicy startPolicy;
+  private final String targetStep;
+  private final String skipUntilStep;
+  private final List<String> skipSteps;
+}
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+class YamlSafTemplateProvider implements SafTemplateProvider {
+
+  private final SafTemplatesConfig config;
+  private final WorkFlowRegistry workFlowRegistry; // to validate step names/order (you already have this)
+
+  @Override
+  public SafDecision getTemplate(String entityType, String eventType, String failedStep) {
+    var group = Optional.ofNullable(config.getGroups()).map(m -> m.get(entityType)).orElse(null);
+    if (group == null) return null;
+
+    var event = Optional.ofNullable(group.getEvents()).map(m -> m.get(eventType)).orElse(null);
+    if (event == null) return null;
+
+    SafTemplatesConfig.StepTemplate t = null;
+
+    // step-specific override first
+    if (event.getSteps() != null && failedStep != null) {
+      t = event.getSteps().get(failedStep);
+    }
+
+    // fallback to defaults
+    if (t == null) t = event.getDefaults();
+    if (t == null) return null;
+
+    // optional validation if strict
+    if (config.isStrict()) {
+      validateNames(entityType, eventType, t, failedStep);
+    }
+
+    return SafDecision.builder()
+        .enabled(t.isEnabled())
+        .startPolicy(t.getStartPolicy())
+        .targetStep(t.getTargetStep())
+        .skipUntilStep(t.getSkipUntilStep())
+        .skipSteps(t.getSkipSteps() == null ? List.of() : t.getSkipSteps())
+        .build();
+  }
+
+  private void validateNames(String entityType, String eventType,
+                             SafTemplatesConfig.StepTemplate t, String failedStep) {
+    var order = workFlowRegistry.getOrderedStepNames(entityType, eventType);
+    if (failedStep != null && !order.contains(failedStep)) {
+      log.warn("[SaF] Unknown failed step '{}' for {}/{}", failedStep, entityType, eventType);
+    }
+    if (t.getTargetStep() != null && !order.contains(t.getTargetStep())) {
+      log.warn("[SaF] Unknown target step '{}' for {}/{}", t.getTargetStep(), entityType, eventType);
+    }
+    if (t.getSkipSteps() != null) {
+      for (var s : t.getSkipSteps()) {
+        if (!order.contains(s)) {
+          log.warn("[SaF] Unknown skip step '{}' for {}/{}", s, entityType, eventType);
+        }
+      }
+    }
+    if (t.getSkipUntilStep() != null && !order.contains(t.getSkipUntilStep())) {
+      log.warn("[SaF] Unknown skipUntilStep '{}' for {}/{}", t.getSkipUntilStep(), entityType, eventType);
+    }
+  }
+}
+
+// package net.jpmchase.payroll.processor.saf;
+
+@RequiredArgsConstructor
+@Slf4j
+@Service
+public class SafService {
+
+  private final SafTemplateProvider safTemplateProvider;
+  private final WorkFlowRegistry workFlowRegistry;
+
+  // ... context keys and enums as before (BEGIN, AT_STEP, BEGIN_WITH_SKIPS)
+
+  public void seed(Event event, WorkflowContext ctx) {
+    // 1) Decide if this message is a SaF/replay.
+    // You said "is it saf message or not" comes from headers. Example:
+    boolean isSaf = "true".equalsIgnoreCase(event.getHeaders().getOrDefault("x-saf", "false"));
+    ctx.put("SAF_ENABLED", isSaf);
+
+    if (!isSaf) return;
+
+    // 2) Preferred: Recon passes failedStep in references (or you can load it from outbox using safRetryId)
+    String entityType = event.getMessageBody().getEntityType();
+    String eventType  = event.getMessageBody().getEventType();
+    String failedStep = getFailedStepFromReferencesOrOutbox(event);
+
+    var decision = safTemplateProvider.getTemplate(entityType, eventType, failedStep);
+    if (decision == null || !decision.isEnabled()) {
+      log.info("[SaF] No template or disabled for {}/{} step '{}'", entityType, eventType, failedStep);
+      return;
+    }
+
+    // store in context (used in shouldExecute)
+    ctx.put("SAF_MODE", decision.getStartPolicy().name());
+    ctx.put("SAF_TARGET", decision.getTargetStep());
+    ctx.put("SAF_SKIP_UNTIL", decision.getSkipUntilStep());
+    ctx.put("SAF_SKIP_SET", new HashSet<>(decision.getSkipSteps()));
+  }
+
+  private String getFailedStepFromReferencesOrOutbox(Event event) {
+    var refs = event.getReferences(); // however you expose references map
+    if (refs != null && refs.containsKey("failedStep")) return refs.get("failedStep");
+    String retryId = refs != null ? refs.get("safRetryId") : null;
+    if (retryId != null) {
+      // lookup outbox to find the step that failed
+      return loadFailedStepFromOutbox(retryId); // implement via DAO
+    }
+    return null;
+  }
+
+  public boolean shouldExecute(String stepName, String conditionName, Event event,
+                               WorkflowContext ctx, BooleanSupplier baseCondition) {
+    if (!(Boolean.TRUE.equals(ctx.get("SAF_ENABLED")))) {
+      return baseCondition.getAsBoolean();
+    }
+    var mode = String.valueOf(ctx.get("SAF_MODE"));
+    switch (mode) {
+      case "BEGIN":
+        return baseCondition.getAsBoolean();
+      case "AT_STEP":
+        String target = (String) ctx.get("SAF_TARGET");
+        return isAtOrAfter(stepName, target, event) && baseCondition.getAsBoolean();
+      case "BEGIN_WITH_SKIPS":
+        String pivot = (String) ctx.get("SAF_SKIP_UNTIL");
+        if (pivot != null && !isAtOrAfter(stepName, pivot, event)) return false;
+        Set<String> skip = (Set<String>) ctx.get("SAF_SKIP_SET");
+        if (skip != null && skip.contains(stepName)) return false;
+        return baseCondition.getAsBoolean();
+      default:
+        return baseCondition.getAsBoolean();
+    }
+  }
+
+  private boolean isAtOrAfter(String current, String pivot, Event event) {
+    if (pivot == null || pivot.isBlank()) return true;
+    var order = workFlowRegistry.getOrderedStepNames(
+        event.getMessageBody().getEntityType(), event.getMessageBody().getEventType());
+    int iCur = order.indexOf(current), iPv = order.indexOf(pivot);
+    return (iCur < 0 || iPv < 0) || iCur >= iPv;
+  }
+}
+
+
