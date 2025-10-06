@@ -1,0 +1,356 @@
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    properties:
+      # Confluent / SR props (switch to your serializer if different)
+      schema.registry.url: ${SCHEMA_REGISTRY_URL}
+      basic.auth.credentials.source: USER_INFO
+      basic.auth.user.info: ${SCHEMA_REGISTRY_API_KEY}:${SCHEMA_REGISTRY_API_SECRET}
+      # idempotence & reliability
+      enable.idempotence: true
+      acks: all
+      retries: 10
+      delivery.timeout.ms: 120000
+      max.in.flight.requests.per.connection: 5
+      linger.ms: 5
+      compression.type: zstd
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      # transactions (optional but recommended if you also write DB in same flow)
+      transaction-id-prefix: recon-tx-
+
+payroll:
+  topic: payroll.events
+  publisher: RECON_MANAGER
+
+package net.jpmchase.payroll.recon.config;
+
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.*;
+import org.springframework.kafka.transaction.KafkaTransactionManager;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+public class KafkaProducerConfig {
+
+  @Value("${spring.kafka.bootstrap-servers}")
+  private String bootstrap;
+
+  @Value("${spring.kafka.properties.schema.registry.url}")
+  private String schemaRegistryUrl;
+
+  @Bean
+  public ProducerFactory<String, Object> producerFactory() {
+    Map<String, Object> props = new HashMap<>();
+    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
+    props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+    props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
+
+    // idempotence & safe defaults
+    props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+    props.put(ProducerConfig.ACKS_CONFIG, "all");
+    props.put(ProducerConfig.RETRIES_CONFIG, 10);
+    props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 120_000);
+    props.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
+    props.put(ProducerConfig.LINGER_MS_CONFIG, 5);
+    props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "zstd");
+
+    // schema registry (other auth props inherited from Spring if set)
+    props.put("schema.registry.url", schemaRegistryUrl);
+
+    DefaultKafkaProducerFactory<String, Object> pf = new DefaultKafkaProducerFactory<>(props);
+    pf.setTransactionIdPrefix("recon-tx-"); // transactional if you call template.executeInTransaction
+    return pf;
+  }
+
+  @Bean
+  public KafkaTemplate<String, Object> kafkaTemplate(ProducerFactory<String, Object> pf) {
+    return new KafkaTemplate<>(pf);
+  }
+
+  @Bean
+  public KafkaTransactionManager<String, Object> kafkaTxManager(ProducerFactory<String, Object> pf) {
+    return new KafkaTransactionManager<>(pf);
+  }
+}
+
+package net.jpmchase.payroll.recon.util;
+
+import java.util.Objects;
+
+public final class ReconIdempotency {
+
+  private ReconIdempotency() {}
+
+  // First-time
+  public static String forProcess(String eventType, String entityType, String entityId, String sourceEventId) {
+    return String.format("PROC:%s:%s:%s:%s",
+        nullToEmpty(eventType), nullToEmpty(entityType), nullToEmpty(entityId), nullToEmpty(sourceEventId));
+  }
+
+  // Replay / SAF (retry outbox id)
+  public static String forReplay(String safRetryId) {
+    return "REPLAY:" + nullToEmpty(safRetryId);
+  }
+
+  // Cancel (idempotent by entity)
+  public static String forCancel(String entityType, String entityId) {
+    return String.format("CANCEL:%s:%s", nullToEmpty(entityType), nullToEmpty(entityId));
+  }
+
+  private static String nullToEmpty(String s) { return s == null ? "" : s; }
+
+  public static void requireNonBlank(String val, String name) {
+    if (val == null || val.isBlank()) throw new IllegalArgumentException(name + " must be provided");
+  }
+}
+
+package net.jpmchase.payroll.recon.publish;
+
+import com.chase.ccb.payments.payroll.PayrollEvent;
+import com.chase.ccb.payments.payroll.PublisherType;
+import com.chase.ccb.payments.payroll.Operation;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+import static net.jpmchase.payroll.recon.util.ReconIdempotency.*;
+
+@Service
+public class ReconPublisher {
+
+  private final KafkaTemplate<String, Object> kafkaTemplate;
+  private final String topic;
+  private final String publisherType; // RECON_MANAGER as string for header mirror
+
+  public ReconPublisher(KafkaTemplate<String, Object> kafkaTemplate,
+                        @Value("${payroll.topic}") String topic,
+                        @Value("${payroll.publisher}") String publisherType) {
+    this.kafkaTemplate = kafkaTemplate;
+    this.topic = topic;
+    this.publisherType = publisherType;
+  }
+
+  // ---------- Public entry points ----------
+
+  /**
+   * Publish a REPLAY (SaF) message.
+   * @param companyId resourceId (partition key) — REQUIRED
+   * @param payrollEventType e.g. "payroll.processed" — REQUIRED
+   * @param entityType e.g. "Payroll" — REQUIRED
+   * @param entityId payroll UUID — REQUIRED
+   * @param safRetryId outbox id — REQUIRED
+   * @param failedStep optional (saves the processor one DB lookup)
+   * @param startPolicy BEGIN | AT_STEP | BEGIN_WITH_SKIPS (optional; else template decides)
+   * @param skipSteps comma-separated step names (optional)
+   * @param skipUntilStep optional pivot step
+   * @param extraRefs any extra references you want to include (nullable)
+   */
+  public void publishReplay(String companyId,
+                            String payrollEventType,
+                            String entityType,
+                            String entityId,
+                            String safRetryId,
+                            String failedStep,
+                            String startPolicy,
+                            String skipSteps,
+                            String skipUntilStep,
+                            Map<String, String> extraRefs) {
+
+    requireNonBlank(companyId, "companyId");
+    requireNonBlank(payrollEventType, "payrollEventType");
+    requireNonBlank(entityType, "entityType");
+    requireNonBlank(entityId, "entityId");
+    requireNonBlank(safRetryId, "safRetryId");
+
+    String eventId = UUID.randomUUID().toString();
+    long now = Instant.now().toEpochMilli();
+
+    // Build references map
+    Map<String, String> refs = new HashMap<>();
+    refs.put("safRetryId", safRetryId);
+    if (failedStep != null)      refs.put("failedStep", failedStep);
+    if (startPolicy != null)     refs.put("startPolicy", startPolicy);         // BEGIN | AT_STEP | BEGIN_WITH_SKIPS
+    if (skipSteps != null)       refs.put("skipSteps", skipSteps);             // "S1,S2"
+    if (skipUntilStep != null)   refs.put("skipUntilStep", skipUntilStep);
+    if (extraRefs != null)       refs.putAll(extraRefs);
+
+    // Avro payload (SpecificRecord builder generated from .avsc)
+    PayrollEvent payload = PayrollEvent.newBuilder()
+        .setEventId(eventId)
+        .setTimestamp(now)
+        .setEventType(payrollEventType)
+        .setEntityType(entityType)
+        .setEntityId(entityId)
+        .setResourceType("Company")
+        .setResourceId(companyId)
+        .setPublisherType(PublisherType.valueOf("RECON_MANAGER"))
+        .setOperation(Operation.REPLAY)
+        .setReferences(refs)
+        .build();
+
+    // Partition key = resourceId (company)
+    String kafkaKey = companyId;
+
+    // Idempotency key
+    String idemKey = forReplay(safRetryId);
+
+    // Headers
+    ProducerRecord<String, Object> record = new ProducerRecord<>(topic, kafkaKey, payload);
+    addHeader(record, "x-idempotency-key", idemKey);
+    addHeader(record, "x-trace-id", eventId);               // reuse eventId or pass your trace
+    addHeader(record, "x-publisher", publisherType);
+    addHeader(record, "x-saf", "true");
+
+    kafkaTemplate.send(record);
+  }
+
+  /**
+   * Publish a CANCEL request.
+   * @param companyId resourceId (partition key)
+   * @param entityType e.g. "Payroll"
+   * @param entityId payroll UUID
+   * @param reason optional
+   * @param extraRefs optional
+   */
+  public void publishCancel(String companyId,
+                            String entityType,
+                            String entityId,
+                            String reason,
+                            Map<String, String> extraRefs) {
+
+    requireNonBlank(companyId, "companyId");
+    requireNonBlank(entityType, "entityType");
+    requireNonBlank(entityId, "entityId");
+
+    String eventId = "cxl-" + UUID.randomUUID();
+    long now = Instant.now().toEpochMilli();
+
+    Map<String, String> refs = new HashMap<>();
+    if (reason != null) refs.put("reason", reason);
+    if (extraRefs != null) refs.putAll(extraRefs);
+
+    PayrollEvent payload = PayrollEvent.newBuilder()
+        .setEventId(eventId)
+        .setTimestamp(now)
+        .setEventType("payroll.cancel.request")
+        .setEntityType(entityType)
+        .setEntityId(entityId)
+        .setResourceType("Company")
+        .setResourceId(companyId)
+        .setPublisherType(PublisherType.valueOf("RECON_MANAGER"))
+        .setOperation(Operation.CANCEL)
+        .setReferences(refs)
+        .build();
+
+    String kafkaKey = companyId;
+    String idemKey = forCancel(entityType, entityId);
+
+    ProducerRecord<String, Object> record = new ProducerRecord<>(topic, kafkaKey, payload);
+    addHeader(record, "x-idempotency-key", idemKey);
+    addHeader(record, "x-trace-id", eventId);
+    addHeader(record, "x-publisher", publisherType);
+
+    kafkaTemplate.send(record);
+  }
+
+  /**
+   * Publish a RECONCILE (window/batch) command.
+   * @param batchId required batch/run id
+   * @param window human-readable window info (optional)
+   * @param extraRefs optional
+   */
+  public void publishReconcile(String batchId, String window, Map<String, String> extraRefs) {
+    requireNonBlank(batchId, "batchId");
+
+    String eventId = "recon-" + UUID.randomUUID();
+    long now = Instant.now().toEpochMilli();
+
+    Map<String, String> refs = new HashMap<>();
+    refs.put("batchId", batchId);
+    if (window != null) refs.put("window", window);
+    if (extraRefs != null) refs.putAll(extraRefs);
+
+    PayrollEvent payload = PayrollEvent.newBuilder()
+        .setEventId(eventId)
+        .setTimestamp(now)
+        .setEventType("payroll.reconcile")
+        .setEntityType("Payroll")
+        .setEntityId("all")
+        .setResourceType("Company")
+        .setResourceId("all")
+        .setPublisherType(PublisherType.valueOf("JOB"))
+        .setOperation(Operation.RECONCILE)
+        .setReferences(refs)
+        .build();
+
+    // Partitioning: if "all" would concentrate, you may choose a stable hash/shard key.
+    String kafkaKey = "all";
+
+    // Make an idempotency key that is stable for this batch
+    String idemKey = "RECONCILE:" + batchId;
+
+    ProducerRecord<String, Object> record = new ProducerRecord<>(topic, kafkaKey, payload);
+    addHeader(record, "x-idempotency-key", idemKey);
+    addHeader(record, "x-trace-id", eventId);
+    addHeader(record, "x-publisher", "JOB");
+
+    kafkaTemplate.send(record);
+  }
+
+  // ---------- helpers ----------
+
+  private static void addHeader(ProducerRecord<String, Object> rec, String k, String v) {
+    if (v == null) return;
+    rec.headers().add(new RecordHeader(k, v.getBytes(StandardCharsets.UTF_8)));
+  }
+}
+
+@Service
+public class ReconCoordinator {
+
+  private final ReconPublisher publisher;
+
+  public ReconCoordinator(ReconPublisher publisher) { this.publisher = publisher; }
+
+  public void enqueueSafReplay(String companyId, String entityId, String safRetryId, String failedStep) {
+    publisher.publishReplay(
+        companyId,
+        "payroll.processed",
+        "Payroll",
+        entityId,
+        safRetryId,
+        failedStep,
+        "BEGIN_WITH_SKIPS",                    // or null to let template decide
+        "GeneratePIMIdentifier,PersistPayrollHierarchyToDatabase",
+        null,
+        Map.of("reason", "timeout contacting PIM"));
+  }
+
+  public void enqueueCancel(String companyId, String entityId, String reason) {
+    publisher.publishCancel(companyId, "Payroll", entityId, reason, null);
+  }
+
+  public void enqueueDailyReconcile(String batchId) {
+    publisher.publishReconcile(batchId, "daily-close-18:30ET", null);
+  }
+}
+
+
+
