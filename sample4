@@ -1,0 +1,193 @@
+@Configuration
+public class ReconKafkaConfig {
+
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Bean
+    public ProducerFactory<String, Object> producerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class);
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        props.put(ProducerConfig.ACKS_CONFIG, "all");
+        props.put(ProducerConfig.RETRIES_CONFIG, 10);
+        props.put(ProducerConfig.LINGER_MS_CONFIG, 5);
+        props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "zstd");
+        return new DefaultKafkaProducerFactory<>(props);
+    }
+
+    @Bean
+    public KafkaTemplate<String, Object> kafkaTemplate(ProducerFactory<String, Object> pf) {
+        return new KafkaTemplate<>(pf);
+    }
+}
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class ReconProducerService {
+
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    @Value("${payroll.topic}")
+    private String topic;
+
+    /**
+     * Publishes a replay (SAF) message.
+     */
+    public void publishReplay(String companyId,
+                              String entityId,
+                              String entityType,
+                              String eventType,
+                              String safRetryId,
+                              String failedStep) {
+
+        String eventId = UUID.randomUUID().toString();
+
+        Map<String, String> references = new HashMap<>();
+        references.put("safRetryId", safRetryId);
+        references.put("failedStep", failedStep);
+
+        PayrollEvent event = PayrollEvent.newBuilder()
+                .setEventId(eventId)
+                .setTimestamp(System.currentTimeMillis())
+                .setEventType(eventType)
+                .setEntityType(entityType)
+                .setEntityId(entityId)
+                .setResourceType("Company")
+                .setResourceId(companyId)
+                .setReferences(references)
+                .build();
+
+        ProducerRecord<String, Object> record = new ProducerRecord<>(topic, companyId, event);
+        record.headers().add("x-saf", "true".getBytes(StandardCharsets.UTF_8));
+        record.headers().add("x-idempotency-key", safRetryId.getBytes(StandardCharsets.UTF_8));
+        record.headers().add("x-publisher", "RECON_MANAGER".getBytes(StandardCharsets.UTF_8));
+
+        kafkaTemplate.send(record);
+        log.info("[RECON] SAF replay published for company {} / retryId {}", companyId, safRetryId);
+    }
+
+    /**
+     * Publishes a cancel event.
+     */
+    public void publishCancel(String companyId,
+                              String entityId,
+                              String entityType,
+                              String reason) {
+
+        String eventId = UUID.randomUUID().toString();
+
+        Map<String, String> references = Map.of("reason", reason);
+
+        PayrollEvent event = PayrollEvent.newBuilder()
+                .setEventId(eventId)
+                .setTimestamp(System.currentTimeMillis())
+                .setEventType("payroll.cancel")
+                .setEntityType(entityType)
+                .setEntityId(entityId)
+                .setResourceType("Company")
+                .setResourceId(companyId)
+                .setReferences(references)
+                .build();
+
+        ProducerRecord<String, Object> record = new ProducerRecord<>(topic, companyId, event);
+        record.headers().add("x-publisher", "RECON_MANAGER".getBytes(StandardCharsets.UTF_8));
+
+        kafkaTemplate.send(record);
+        log.info("[RECON] Cancel event published for company {} / entity {}", companyId, entityId);
+    }
+
+    /**
+     * Publishes an end-of-day reconciliation event.
+     */
+    public void publishReconcile(String batchId) {
+        String eventId = UUID.randomUUID().toString();
+
+        Map<String, String> refs = Map.of("batchId", batchId);
+
+        PayrollEvent event = PayrollEvent.newBuilder()
+                .setEventId(eventId)
+                .setTimestamp(System.currentTimeMillis())
+                .setEventType("payroll.reconcile")
+                .setEntityType("Payroll")
+                .setEntityId("all")
+                .setResourceType("Company")
+                .setResourceId("all")
+                .setReferences(refs)
+                .build();
+
+        ProducerRecord<String, Object> record = new ProducerRecord<>(topic, "all", event);
+        record.headers().add("x-publisher", "JOB".getBytes(StandardCharsets.UTF_8));
+
+        kafkaTemplate.send(record);
+        log.info("[RECON] EOD Reconcile published for batch {}", batchId);
+    }
+}
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class PayrollEventListener {
+
+    private final EventProcessorService eventProcessorService;
+
+    @KafkaListener(
+        topics = "${payroll.topic}",
+        containerFactory = "kafkaListenerContainerFactory",
+        groupId = "payroll-processor-group"
+    )
+    public void onMessage(PayrollEvent event,
+                          @Header(KafkaHeaders.RECEIVED_KEY) String key,
+                          @Header(value = "x-publisher", required = false) String publisher,
+                          @Header(value = "x-saf", required = false) String safFlag,
+                          @Header(value = "x-idempotency-key", required = false) String idempotencyKey) {
+
+        log.info("[PROCESSOR] Received event {} for company {}, publisher={}, saf={}, idemKey={}",
+                event.getEventType(), key, publisher, safFlag, idempotencyKey);
+
+        try {
+            eventProcessorService.processEvent(event, publisher, safFlag, idempotencyKey);
+        } catch (Exception e) {
+            log.error("[PROCESSOR] Error while processing event {} for key {}", event.getEventId(), key, e);
+        }
+    }
+}
+@Configuration
+@EnableKafka
+public class KafkaConsumerConfig {
+
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Bean
+    public Map<String, Object> consumerProps() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "payroll-processor-group");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, KafkaAvroDeserializer.class);
+        props.put("specific.avro.reader", true);
+        return props;
+    }
+
+    @Bean
+    public ConsumerFactory<String, PayrollEvent> consumerFactory() {
+        return new DefaultKafkaConsumerFactory<>(consumerProps());
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, PayrollEvent> kafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory<String, PayrollEvent> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory());
+        factory.setConcurrency(6); // tune per partition count
+        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+        return factory;
+    }
+}
+
+
+
