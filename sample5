@@ -1,0 +1,178 @@
+// package net.jpmchase.payroll.recon.kafka;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class SafProducerService {
+
+  private final KafkaTemplate<String, Object> kafkaTemplate;
+
+  @Value("${payroll.topic}")         private String topic;
+  @Value("${recon.replay-event-type}")     private String replayEventType;
+  @Value("${recon.cancel-event-type}")     private String cancelEventType;
+  @Value("${recon.reconcile-event-type}")  private String reconcileEventType;
+
+  public void publishReplay(String companyId, String entityId, String entityType,
+                            String failedStep, String retryId, int attempt) {
+    String eventId = UUID.randomUUID().toString();
+
+    var event = PayrollManagementProcessingEventReceived.newBuilder()
+        .setEventIdentifier(eventId)
+        .setEventProcessTimestamp(System.currentTimeMillis())
+        .setEventTypeName(replayEventType)
+        .setEntityTypeName(entityType)
+        .setEntityIdentifier(entityId)
+        .setResourceTypeName("Company")
+        .setResourceIdentifier(companyId)
+        .build();
+
+    var record = new ProducerRecord<String, Object>(topic, companyId, event);
+    header(record, "x-publisher", "RECON_MANAGER");
+    header(record, "x-saf", "true");
+    header(record, "x-idempotency-key", IdempotencyKeys.replay(retryId));
+    header(record, "x-retry-attempt", Integer.toString(attempt));
+    if (failedStep != null) header(record, "x-failed-step", failedStep);
+
+    kafkaTemplate.send(record);
+    log.info("[RECON] REPLAY published company={} retryId={} step={} attempt={}",
+        companyId, retryId, failedStep, attempt);
+  }
+
+  public void publishCancel(String companyId, String entityType, String entityId, String reason) {
+    String eventId = "cxl-" + UUID.randomUUID();
+
+    var event = PayrollManagementProcessingEventReceived.newBuilder()
+        .setEventIdentifier(eventId)
+        .setEventProcessTimestamp(System.currentTimeMillis())
+        .setEventTypeName(cancelEventType)
+        .setEntityTypeName(entityType)
+        .setEntityIdentifier(entityId)
+        .setResourceTypeName("Company")
+        .setResourceIdentifier(companyId)
+        .build();
+
+    var record = new ProducerRecord<String, Object>(topic, companyId, event);
+    header(record, "x-publisher", "RECON_MANAGER");
+    header(record, "x-idempotency-key", IdempotencyKeys.cancel(entityType, entityId));
+    if (reason != null) header(record, "x-reason", reason);
+
+    kafkaTemplate.send(record);
+    log.info("[RECON] CANCEL published company={} entity={}/{} reason={}", companyId, entityType, entityId, reason);
+  }
+
+  public void publishReconcile(String batchId) {
+    String eventId = "recon-" + UUID.randomUUID();
+
+    var event = PayrollManagementProcessingEventReceived.newBuilder()
+        .setEventIdentifier(eventId)
+        .setEventProcessTimestamp(System.currentTimeMillis())
+        .setEventTypeName(reconcileEventType)
+        .setEntityTypeName("Payroll")
+        .setEntityIdentifier("all")
+        .setResourceTypeName("Company")
+        .setResourceIdentifier("all")
+        .build();
+
+    var record = new ProducerRecord<String, Object>(topic, "all", event);
+    header(record, "x-publisher", "JOB");
+    header(record, "x-idempotency-key", "RECONCILE:" + batchId);
+    header(record, "x-batch-id", batchId);
+
+    kafkaTemplate.send(record);
+    log.info("[RECON] RECONCILE published batchId={}", batchId);
+  }
+
+  private static void header(ProducerRecord<String, Object> r, String k, String v) {
+    r.headers().add(new RecordHeader(k, v.getBytes(StandardCharsets.UTF_8)));
+  }
+}
+// package net.jpmchase.payroll.recon.support;
+public final class IdempotencyKeys {
+  private IdempotencyKeys(){}
+  public static String replay(String retryId) { return "REPLAY:" + (retryId == null ? "" : retryId); }
+  public static String cancel(String entityType, String entityId) { return "CANCEL:" + nz(entityType) + ":" + nz(entityId); }
+  private static String nz(String s){ return s == null ? "" : s; }
+}
+// package net.jpmchase.payroll.recon.scheduler;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+@ConditionalOnProperty(prefix = "recon.scheduler", name = "enabled", havingValue = "true", matchIfMissing = true)
+public class ReconRetryScheduler {
+
+  private final ReconOutboxRepository repo;
+  private final SafProducerService producer;
+
+  @Value("${recon.batch-size:500}")    private int batchSize;
+  @Value("${recon.max-retry-count:3}") private int maxRetries;
+  @Value("${recon.lease-seconds:300}") private int leaseSeconds;
+
+  @Scheduled(fixedDelayString = "${recon.scheduler.fixed-delay-ms:300000}")
+  @SchedulerLock(name = "ReconRetryScheduler.run", lockAtLeastFor = "PT1M", lockAtMostFor = "PT4M30S")
+  public void run() {
+    log.info("[RECON] cycle start");
+
+    var replays = repo.claimReplayBatch(maxRetries, batchSize, leaseSeconds);
+    for (var r : replays) {
+      try {
+        producer.publishReplay(
+            r.getSourceCompanyId(),
+            r.getEntityId(),
+            r.getEntityTypeName(),
+            r.getStepName(),
+            r.getRetryId(),
+            r.getRetryCount() + 1);
+        repo.markSent(r.getRetryId(), "replay published");
+      } catch (Exception e) {
+        log.error("[RECON] publish replay failed retryId={} company={} step={}",
+            r.getRetryId(), r.getSourceCompanyId(), r.getStepName(), e);
+        repo.markPublishFailed(r.getRetryId(), firstLine(e));
+      }
+    }
+
+    var cancels = repo.claimCancelBatch(maxRetries, batchSize);
+    for (var r : cancels) {
+      try {
+        var reason = (r.getExpiryTs() != null && r.getExpiryTs().isBefore(Instant.now()))
+            ? "retry_expired" : "max_retries_exhausted";
+        producer.publishCancel(r.getSourceCompanyId(), r.getEntityTypeName(), r.getEntityId(), reason);
+        repo.markCancelSent(r.getRetryId(), "cancel published");
+      } catch (Exception e) {
+        log.error("[RECON] publish cancel failed retryId={} company={} entity={}",
+            r.getRetryId(), r.getSourceCompanyId(), r.getEntityId(), e);
+        repo.markPublishFailed(r.getRetryId(), firstLine(e));
+      }
+    }
+
+    log.info("[RECON] cycle end — replays={} cancels={}", replays.size(), cancels.size());
+  }
+
+  private static String firstLine(Exception e) {
+    String m = e.getMessage();
+    return (m == null) ? e.getClass().getSimpleName() : m.split("\\R", 2)[0];
+  }
+}
+
+// package net.jpmchase.payroll.processor.adapters;
+@Service
+@RequiredArgsConstructor
+public class SafCompletionPublisherHook {
+
+  private final ReconOutboxRepository reconRepo;
+
+  public void onSuccessfulSafProcessing(Headers headers) {
+    var idem = header(headers, "x-idempotency-key");
+    if (idem != null && idem.startsWith("REPLAY:")) {
+      var retryId = idem.substring("REPLAY:".length());
+      if (!retryId.isBlank()) reconRepo.markProcessed(retryId);
+    }
+  }
+
+  private static String header(Headers h, String key) {
+    var it = h.headers(key).iterator();
+    return it.hasNext() ? new String(it.next().value(), StandardCharsets.UTF_8) : null;
+  }
+}
+
+
