@@ -175,4 +175,101 @@ public class SafCompletionPublisherHook {
   }
 }
 
+// package net.jpmchase.payroll.recon.outbox;
 
+public interface ReconOutboxRepository extends JpaRepository<RetryOutboxRow, String> {
+
+  // Claim replay rows: FAILED, under maxRetries, not expired, lease elapsed
+  @Modifying
+  @Query(value = """
+    WITH c AS (
+      SELECT pyrl_rtry_id
+        FROM pyrl_rtry_outbox
+       WHERE sts_cd = 0
+         AND rtry_cn < :maxRetries
+         AND (expr_ts IS NULL OR expr_ts > NOW())
+         AND (updt_ts IS NULL OR updt_ts < NOW() - (:leaseSeconds || ' seconds')::interval)
+       ORDER BY cre_ts
+       FOR UPDATE SKIP LOCKED
+       LIMIT :batchSize
+    )
+    UPDATE pyrl_rtry_outbox r
+       SET sts_cd = 1,
+           updt_ts = NOW(),
+           sts_rsn_tx = 'claimed for replay'
+     WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+     RETURNING r.*;
+  """, nativeQuery = true)
+  List<RetryOutboxRow> claimReplayBatch(@Param("maxRetries") int maxRetries,
+                                        @Param("batchSize") int batchSize,
+                                        @Param("leaseSeconds") int leaseSeconds);
+
+  // Claim cancel rows: FAILED and exhausted or expired
+  @Modifying
+  @Query(value = """
+    WITH c AS (
+      SELECT pyrl_rtry_id
+        FROM pyrl_rtry_outbox
+       WHERE sts_cd = 0
+         AND (rtry_cn >= :maxRetries OR (expr_ts IS NOT NULL AND expr_ts <= NOW()))
+       ORDER BY cre_ts
+       FOR UPDATE SKIP LOCKED
+       LIMIT :batchSize
+    )
+    UPDATE pyrl_rtry_outbox r
+       SET sts_cd = 1,
+           updt_ts = NOW(),
+           sts_rsn_tx = 'claimed for cancel'
+     WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+     RETURNING r.*;
+  """, nativeQuery = true)
+  List<RetryOutboxRow> claimCancelBatch(@Param("maxRetries") int maxRetries,
+                                        @Param("batchSize") int batchSize);
+
+  // Mark publish success (REPLAY → SENT)
+  @Modifying
+  @Query(value = """
+    UPDATE pyrl_rtry_outbox
+       SET sts_cd = 2,
+           rtry_cn = rtry_cn + 1,
+           updt_ts = NOW(),
+           sts_rsn_tx = :reason
+     WHERE pyrl_rtry_id = :retryId
+  """, nativeQuery = true)
+  int markSent(@Param("retryId") String retryId, @Param("reason") String reason);
+
+  // Mark publish failed (back to FAILED, bump count)
+  @Modifying
+  @Query(value = """
+    UPDATE pyrl_rtry_outbox
+       SET sts_cd = 0,
+           rtry_cn = rtry_cn + 1,
+           updt_ts = NOW(),
+           sts_rsn_tx = :error
+     WHERE pyrl_rtry_id = :retryId
+  """, nativeQuery = true)
+  int markPublishFailed(@Param("retryId") String retryId, @Param("error") String error);
+
+  // Mark cancel sent
+  @Modifying
+  @Query(value = """
+    UPDATE pyrl_rtry_outbox
+       SET sts_cd = 3,
+           rtry_cn = rtry_cn + 1,
+           updt_ts = NOW(),
+           sts_rsn_tx = :reason
+     WHERE pyrl_rtry_id = :retryId
+  """, nativeQuery = true)
+  int markCancelSent(@Param("retryId") String retryId, @Param("reason") String reason);
+
+  // Mark processed (called by Processor on success)
+  @Modifying
+  @Query(value = """
+    UPDATE pyrl_rtry_outbox
+       SET sts_cd = 4,
+           updt_ts = NOW(),
+           sts_rsn_tx = 'processor completed'
+     WHERE pyrl_rtry_id = :retryId
+  """, nativeQuery = true)
+  int markProcessed(@Param("retryId") String retryId);
+}
