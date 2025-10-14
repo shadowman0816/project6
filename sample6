@@ -384,3 +384,107 @@ public class EventProcessorService {
 
   // classifyException, handleBusinessValidationException, handleException — keep your existing code
 }
+public interface ReconOutboxRepository extends JpaRepository<RetryOutboxRow, String> {
+
+  // ===== SAME-DAY (expr_ts::date = :today) =====
+
+  @Modifying
+  @Query(value = """
+    WITH c AS (
+      SELECT pyrl_rtry_id
+        FROM pyrl_rtry_outbox
+       WHERE sts_cd = 0                               -- FAILED
+         AND rtry_cn < :maxRetries
+         AND (expr_ts IS NULL OR expr_ts > NOW())     -- not expired
+         AND (expr_ts IS NOT NULL AND expr_ts::date = :today)  -- same-day by expiry date
+         AND (updt_ts IS NULL OR updt_ts < NOW() - (:leaseSeconds || ' seconds')::interval)
+       ORDER BY cre_ts
+       FOR UPDATE SKIP LOCKED
+       LIMIT :batchSize
+    )
+    UPDATE pyrl_rtry_outbox r
+       SET sts_cd = 1,                                -- IN_PROGRESS
+           updt_ts = NOW(),
+           sts_rsn_tx = 'claimed for replay (same-day)'
+     WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+     RETURNING r.*;
+  """, nativeQuery = true)
+  List<RetryOutboxRow> claimReplaySameDay(@Param("today") LocalDate today,
+                                          @Param("maxRetries") int maxRetries,
+                                          @Param("batchSize") int batchSize,
+                                          @Param("leaseSeconds") int leaseSeconds);
+
+  @Modifying
+  @Query(value = """
+    WITH c AS (
+      SELECT pyrl_rtry_id
+        FROM pyrl_rtry_outbox
+       WHERE sts_cd = 0
+         AND (rtry_cn >= :maxRetries OR (expr_ts IS NOT NULL AND expr_ts <= NOW()))
+         AND (expr_ts IS NOT NULL AND expr_ts::date = :today)
+       ORDER BY cre_ts
+       FOR UPDATE SKIP LOCKED
+       LIMIT :batchSize
+    )
+    UPDATE pyrl_rtry_outbox r
+       SET sts_cd = 1,
+           updt_ts = NOW(),
+           sts_rsn_tx = 'claimed for cancel (same-day)'
+     WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+     RETURNING r.*;
+  """, nativeQuery = true)
+  List<RetryOutboxRow> claimCancelSameDay(@Param("today") LocalDate today,
+                                          @Param("maxRetries") int maxRetries,
+                                          @Param("batchSize") int batchSize);
+
+  // ===== FUTURE-DATED (expr_ts::date > :today) =====
+
+  @Modifying
+  @Query(value = """
+    WITH c AS (
+      SELECT pyrl_rtry_id
+        FROM pyrl_rtry_outbox
+       WHERE sts_cd = 0
+         AND rtry_cn < :maxRetries
+         AND (expr_ts IS NULL OR expr_ts > NOW())     -- not expired
+         AND (expr_ts IS NOT NULL AND expr_ts::date > :today)
+         AND (updt_ts IS NULL OR updt_ts < NOW() - (:leaseSeconds || ' seconds')::interval)
+       ORDER BY expr_ts, cre_ts
+       FOR UPDATE SKIP LOCKED
+       LIMIT :batchSize
+    )
+    UPDATE pyrl_rtry_outbox r
+       SET sts_cd = 1,
+           updt_ts = NOW(),
+           sts_rsn_tx = 'claimed for replay (future-dated)'
+     WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+     RETURNING r.*;
+  """, nativeQuery = true)
+  List<RetryOutboxRow> claimReplayFuture(@Param("today") LocalDate today,
+                                         @Param("maxRetries") int maxRetries,
+                                         @Param("batchSize") int batchSize,
+                                         @Param("leaseSeconds") int leaseSeconds);
+
+  @Modifying
+  @Query(value = """
+    WITH c AS (
+      SELECT pyrl_rtry_id
+        FROM pyrl_rtry_outbox
+       WHERE sts_cd = 0
+         AND (rtry_cn >= :maxRetries OR (expr_ts IS NOT NULL AND expr_ts <= NOW()))
+         AND (expr_ts IS NOT NULL AND expr_ts::date > :today)
+       ORDER BY expr_ts, cre_ts
+       FOR UPDATE SKIP LOCKED
+       LIMIT :batchSize
+    )
+    UPDATE pyrl_rtry_outbox r
+       SET sts_cd = 1,
+           updt_ts = NOW(),
+           sts_rsn_tx = 'claimed for cancel (future-dated)'
+     WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+     RETURNING r.*;
+  """, nativeQuery = true)
+  List<RetryOutboxRow> claimCancelFuture(@Param("today") LocalDate today,
+                                         @Param("maxRetries") int maxRetries,
+                                         @Param("batchSize") int batchSize);
+}
