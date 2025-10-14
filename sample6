@@ -1,0 +1,386 @@
+@FunctionalInterface
+public interface ClaimReplayFn {
+  List<RetryOutboxRow> claim(LocalDate today, int maxRetries, int batchSize, int leaseSeconds);
+}
+
+@FunctionalInterface
+public interface ClaimCancelFn {
+  List<RetryOutboxRow> claim(LocalDate today, int maxRetries, int batchSize);
+}
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class SafScheduler {
+
+  private final ReconOutboxRepository repo;
+  private final SafProducerService producer;
+
+  @Value("${recon.batch-size:500}")    private int batchSize;
+  @Value("${recon.max-retry-count:3}") private int maxRetries;
+  @Value("${recon.lease-seconds:300}") private int leaseSeconds;
+  @Value("${recon.tz:UTC}")            private String tz;
+  @Value("${recon.future-dated.start-minute-offset:30}") private int futureStartOffsetMin;
+
+  // ======= SAME-DAY window (00:00–18:00, every 15m) =======
+  @Scheduled(cron = "${recon.same-day.cron:0 */15 0-17 * * *}")
+  @SchedulerLock(name = "SafScheduler.sameDay", lockAtLeastFor = "PT1M", lockAtMostFor = "PT4M")
+  public void runSameDay() {
+    if (isAfter(LocalTime.of(18, 0))) return; // guard
+    runBucket(
+        "same-day",
+        repo::claimReplaySameDay,
+        repo::claimCancelSameDay
+    );
+  }
+
+  // ======= FUTURE-DATED window (19:30–23:59, every 15m) =======
+  @Scheduled(cron = "${recon.future-dated.cron:0 */15 19-23 * * *}")
+  @SchedulerLock(name = "SafScheduler.futureDated", lockAtLeastFor = "PT1M", lockAtMostFor = "PT4M")
+  public void runFutureDated() {
+    if (isHour(19) && minute() < futureStartOffsetMin) return; // start at 19:30
+    runBucket(
+        "future-dated",
+        repo::claimReplayFuture,
+        repo::claimCancelFuture
+    );
+  }
+
+  /* ------------------ Core reusable logic ------------------ */
+
+  private void runBucket(String label,
+                         ClaimReplayFn claimReplay,
+                         ClaimCancelFn claimCancel) {
+    ZoneId zone = ZoneId.of(tz);
+    LocalDate today = ZonedDateTime.now(zone).toLocalDate();
+
+    log.info("[SAF] {} cycle start (today={}, tz={})", label, today, tz);
+
+    // REPLAY
+    var replays = claimReplay.claim(today, maxRetries, batchSize, leaseSeconds);
+    for (var r : replays) publishReplayAndMark(label, r);
+
+    // CANCEL
+    var cancels = claimCancel.claim(today, maxRetries, batchSize);
+    for (var r : cancels) publishCancelAndMark(label, r);
+
+    log.info("[SAF] {} cycle end — replays={} cancels={}", label, replays.size(), cancels.size());
+  }
+
+  private void publishReplayAndMark(String label, RetryOutboxRow r) {
+    try {
+      producer.publishReplay(
+          r.getSourceCompanyId(),
+          r.getEntityId(),
+          r.getEntityTypeName(),
+          r.getStepName(),
+          r.getRetryId(),
+          r.getRetryCount() + 1
+      );
+      repo.markSent(r.getRetryId(), "replay published (" + label + ")");
+    } catch (Exception e) {
+      log.error("[SAF] publish replay failed ({}) retryId={} company={} step={}",
+          label, r.getRetryId(), r.getSourceCompanyId(), r.getStepName(), e);
+      repo.markPublishFailed(r.getRetryId(), firstLine(e));
+    }
+  }
+
+  private void publishCancelAndMark(String label, RetryOutboxRow r) {
+    try {
+      String reason = (r.getExpiryTs() != null && r.getExpiryTs().isBefore(Instant.now()))
+          ? "retry_expired" : "max_retries_exhausted";
+      producer.publishCancel(
+          r.getSourceCompanyId(),
+          r.getEntityTypeName(),
+          r.getEntityId(),
+          reason
+      );
+      repo.markCancelSent(r.getRetryId(), "cancel published (" + label + ")");
+    } catch (Exception e) {
+      log.error("[SAF] publish cancel failed ({}) retryId={} company={} entity={}",
+          label, r.getRetryId(), r.getSourceCompanyId(), r.getEntityId(), e);
+      repo.markPublishFailed(r.getRetryId(), firstLine(e));
+    }
+  }
+
+  /* ------------------ tiny helpers ------------------ */
+
+  private boolean isAfter(LocalTime limit) {
+    return ZonedDateTime.now(ZoneId.of(tz)).toLocalTime().isAfter(limit);
+  }
+  private boolean isHour(int h) { return ZonedDateTime.now(ZoneId.of(tz)).getHour() == h; }
+  private int minute() { return ZonedDateTime.now(ZoneId.of(tz)).getMinute(); }
+
+  private static String firstLine(Exception e) {
+    String m = e.getMessage();
+    return (m == null) ? e.getClass().getSimpleName() : m.split("\\R", 2)[0];
+  }
+}
+package net.jpmchase.payroll.processor.saf;
+
+import lombok.*;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import net.jpmchase.payroll.processor.common.context.WorkflowContext;
+import net.jpmchase.payroll.processor.registry.WorkFlowRegistry;
+import net.jpmchase.payroll.processor.common.config.StepConfig;
+import net.jpmchase.payroll.processor.event.Event;
+
+import java.util.*;
+import java.util.function.BooleanSupplier;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class SafService {
+
+  // ===== Context keys (kept as Strings to avoid enums in context) =====
+  public static final String SAF_ENABLED   = "SAF_ENABLED";
+  public static final String SAF_MODE      = "SAF_MODE";         // START_FROM_FIRST | RETRY_FROM_FAILED | START_WITH_SKIP
+  public static final String SAF_TARGET    = "SAF_TARGET_STEP";  // which step to start from (for RETRY_FROM_FAILED)
+  public static final String SAF_SKIP_UNTIL= "SAF_SKIP_UNTIL";   // pivot; execute when current >= pivot
+  public static final String SAF_SKIP_SET  = "SAF_SKIP_SET";     // Set<String> of steps to skip when in START_WITH_SKIP
+
+  // SAF operating modes
+  public enum SafMode { START_FROM_FIRST, RETRY_FROM_FAILED, START_WITH_SKIP }
+
+  private final WorkFlowRegistry workFlowRegistry;
+  private final SafTemplateProvider safTemplateProvider;   // your provider that reads saf-config.yml
+  private final RetryScheduleService retryScheduleService; // to fetch failed step by retryId (outbox)
+
+  // ====== Seed once per event ======
+  public void seed(Event event, WorkflowContext ctx) {
+    // Is it a SAF replay? (header set by RECON producer)
+    boolean isSaf = "true".equalsIgnoreCase(event.getHeaders().getOrDefault("x-saf", "false"));
+    ctx.put(SAF_ENABLED, isSaf);
+
+    if (!isSaf) return;
+
+    // Derive the failed step from retry outbox / header
+    String failedStep = getFailedStepFromOutbox(event);
+    if (failedStep == null || failedStep.isBlank()) {
+      log.warn("[SAF] No retry outbox row/failed step for event {}; disabling SAF for this message", event.getMessageBody().getEventId());
+      ctx.put(SAF_ENABLED, false);
+      return;
+    }
+
+    // Load template based on entity/event/failedStep
+    String entityType = event.getMessageBody().getEntityType();
+    String eventType  = event.getMessageBody().getEventType();
+    var decision = safTemplateProvider.getTemplate(entityType, eventType, failedStep);
+    if (decision == null || !decision.isEnabled()) {
+      log.info("[SAF] No template or disabled for {}/{}/{}", entityType, eventType, failedStep);
+      ctx.put(SAF_ENABLED, false);
+      return;
+    }
+
+    // Place decision in context
+    ctx.put(SAF_MODE, decision.getStartPolicy().name());
+    ctx.put(SAF_TARGET, decision.getTargetStep());                   // may be null
+    ctx.put(SAF_SKIP_UNTIL, decision.getSkipUntilStep());            // may be null
+    ctx.put(SAF_SKIP_SET, new HashSet<>(decision.getSkipSteps()));   // may be empty
+  }
+
+  // ====== Hook from EventProcessorService for each step ======
+  public boolean shouldExecute(String stepName,
+                               String conditionBeanName,
+                               Event event,
+                               WorkflowContext ctx,
+                               BooleanSupplier baseCondition) {
+    // Not a SAF replay → keep original behavior
+    if (!Boolean.TRUE.equals(ctx.get(SAF_ENABLED))) {
+      return baseCondition.getAsBoolean();
+    }
+
+    SafMode mode = SafMode.valueOf(String.valueOf(ctx.get(SAF_MODE)));
+
+    switch (mode) {
+      case START_FROM_FIRST:
+        // Always from beginning; optionally skip a known prefix until a pivot
+        String pivot = (String) ctx.get(SAF_SKIP_UNTIL); // optional
+        if (pivot != null && !isAtOrAfter(stepName, pivot, event)) return false;
+        // honor per-step skip set as well
+        @SuppressWarnings("unchecked")
+        Set<String> skipSet = (Set<String>) ctx.getOrDefault(SAF_SKIP_SET, Collections.emptySet());
+        if (skipSet.contains(stepName)) return false;
+        return baseCondition.getAsBoolean();
+
+      case RETRY_FROM_FAILED:
+        // Start executing from the failed step onward
+        String target = (String) ctx.get(SAF_TARGET);
+        if (target == null) return baseCondition.getAsBoolean();
+        if (!isAtOrAfter(stepName, target, event)) return false;
+        return baseCondition.getAsBoolean();
+
+      case START_WITH_SKIP:
+        // Start from beginning but skip declared steps (and optional pivot)
+        String until = (String) ctx.get(SAF_SKIP_UNTIL);
+        if (until != null && !isAtOrAfter(stepName, until, event)) return false;
+        @SuppressWarnings("unchecked")
+        Set<String> toSkip = (Set<String>) ctx.getOrDefault(SAF_SKIP_SET, Collections.emptySet());
+        if (toSkip.contains(stepName)) return false;
+        return baseCondition.getAsBoolean();
+
+      default:
+        return baseCondition.getAsBoolean();
+    }
+  }
+
+  // ====== Helpers ======
+
+  private boolean isAtOrAfter(String currentStep, String pivotStep, Event event) {
+    if (pivotStep == null || pivotStep.isBlank()) return true;
+    List<String> order = workFlowRegistry.getOrderedStepNames(
+        event.getMessageBody().getEntityType(),
+        event.getMessageBody().getEventType());
+
+    int cur = order.indexOf(currentStep);
+    int pv  = order.indexOf(pivotStep);
+    return (cur < 0 || pv < 0) || cur >= pv;
+  }
+
+  private String getFailedStepFromOutbox(Event event) {
+    // Strategy: prefer explicit header; else pull by retryId (if you store retryId in eventId or refs)
+    String retryIdHdr = event.getHeaders().get("x-idempotency-key"); // e.g., "REPLAY:<retryId>"
+    String retryId = null;
+    if (retryIdHdr != null && retryIdHdr.startsWith("REPLAY:")) {
+      retryId = retryIdHdr.substring("REPLAY:".length());
+    }
+    if (retryId == null || retryId.isBlank()) {
+      // fallback: some teams stash retryId == eventId for SAF
+      retryId = String.valueOf(event.getMessageBody().getEventId());
+    }
+    return retryScheduleService.getFailedStepFromRetryOutbox(retryId).orElse(null);
+  }
+}
+
+package net.jpmchase.payroll.processor.service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import net.jpmchase.payroll.processor.common.context.WorkflowContext;
+import net.jpmchase.payroll.processor.common.config.StepConfig;
+import net.jpmchase.payroll.processor.registry.WorkFlowRegistry;
+import net.jpmchase.payroll.processor.registry.ConditionRegistry;
+import net.jpmchase.payroll.processor.saf.SafService;
+import net.jpmchase.payroll.processor.event.Event;
+
+import java.util.Collections;
+import java.util.function.BooleanSupplier;
+
+import static net.jpmchase.payroll.processor.common.context.WorkflowContextKeys.*; // if you have any
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class EventProcessorService {
+
+  private final WorkFlowRegistry workFlowRegistry;
+  private final ConditionRegistry conditionRegistry;
+  private final SafService safService;
+  private final java.util.Map<String, Step> stepRegistry;
+
+  public void processEvent(Event event) {
+    final String eventId   = String.valueOf(event.getMessageBody().getEventId());
+    final String companyId = String.valueOf(event.getMessageBody().getResourceUUID());
+    log.info("[PROCESSOR] Starting processing of event: {}", eventId);
+
+    WorkflowContext context = new WorkflowContext();
+    context.setStatus(WorkflowContext.Status.INITIATED);
+    context.put("EVENT", event);
+    context.put("GUSTO_EVENTID", eventId);   // your existing MDC/context keys if any
+
+    // >>>>> SAF hook (new)
+    safService.seed(event, context);
+
+    try {
+      for (StepConfig stepConfig : getStepsForEvent(event, context)) {
+        executeStepWithRetry(stepConfig, context);
+        if (!context.getStatus().name().equalsIgnoreCase("SUCCESS")) {
+          break;
+        }
+      }
+      context.setStatus(WorkflowContext.Status.COMPLETED);
+    } finally {
+      // MDC.clear() if you use MDC
+    }
+    log.info("[PROCESSOR] Event processing completed for event: {}", eventId);
+  }
+
+  private Iterable<StepConfig> getStepsForEvent(final Event event, final WorkflowContext context) {
+    final String entityType = event.getMessageBody().getEntityType();
+    final String eventType  = event.getMessageBody().getEventType();
+    context.setEventType(eventType);
+    context.setEntityType(entityType);
+    var steps = workFlowRegistry.getStepsForEvent(entityType, eventType);
+    if (steps.isEmpty()) {
+      log.warn("[PROCESSOR] No workflow found for event '{}' and entity type '{}'. Skipping.", eventType, entityType);
+      return Collections.emptyList();
+    }
+    return steps;
+  }
+
+  private void executeStepWithRetry(final StepConfig stepConfig, final WorkflowContext context) {
+    int retryCount = 0;
+    String stepName = stepConfig.getName();
+    context.put("STEP_NAME", stepName);
+    int maxRetries = workFlowRegistry.getRetryCountForStep(stepConfig);
+    log.info("[PROCESSOR] Executing step '{}' (Attempt {}/{})", stepName, retryCount + 1, maxRetries);
+
+    Step stepExecutor = stepRegistry.get(stepName);
+    if (stepExecutor == null) {
+      log.warn("[PROCESSOR] Step '{}' not found in registry. Skipping.", stepName);
+      return;
+    }
+
+    // ---- evaluate "shouldExecute" using SAF-aware delegator ----
+    Event event = (Event) context.get("EVENT");
+
+    BooleanSupplier baseCondition = () -> {
+      String condName = stepConfig.getExecuteOnCondition();
+      if (condName == null || condName.equalsIgnoreCase("always")) return true;
+      var cond = conditionRegistry.get(condName);
+      if (cond == null) {
+        log.warn("[PROCESSOR] No condition bean for '{}'. Executing by default.", condName);
+        return true;
+      }
+      try { return cond.evaluate(context); }
+      catch (Exception e) {
+        log.error("[PROCESSOR] Failed to evaluate condition '{}': {}", condName, e.getMessage());
+        return false;
+      }
+    };
+
+    if (!safService.shouldExecute(stepName, stepConfig.getExecuteOnCondition(), event, context, baseCondition)) {
+      log.info("[PROCESSOR] Skipping step '{}' due to SAF/base condition.", stepName);
+      return;
+    }
+
+    boolean retryEnabled = stepConfig.isRetryEnabled();
+    int max = retryEnabled ? maxRetries : 0;
+
+    while (retryCount <= max) {
+      try {
+        stepExecutor.execute(context);
+        context.setStatus(WorkflowContext.Status.SUCCESS);
+        log.info("[PROCESSOR] Step '{}' executed successfully on attempt {}", stepName, retryCount + 1);
+        return;
+      } catch (Exception e) {
+        ProcessorException classified = classifyException(e, stepName);
+        if (handleBusinessValidationException(classified, stepConfig, context, stepName, retryCount, max)) return;
+        retryCount++;
+        log.warn("[PROCESSOR] Step '{}' failed on attempt {}/{}. Retrying… Reason: {}",
+            stepName, retryCount, max, classified.getMessage());
+        if (retryCount > max) {
+          handleException(stepConfig, context, classified, stepName, retryCount, max);
+          return;
+        }
+      }
+    }
+  }
+
+  // classifyException, handleBusinessValidationException, handleException — keep your existing code
+}
