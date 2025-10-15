@@ -488,3 +488,84 @@ public interface ReconOutboxRepository extends JpaRepository<RetryOutboxRow, Str
                                          @Param("maxRetries") int maxRetries,
                                          @Param("batchSize") int batchSize);
 }
+
+// package net.jpmchase.payroll.processor.event.consumer.mapper;
+
+@Component
+public class EventMapper {
+
+  // your generated Avro type used by both Producer and Processor
+  // import com.chase.ccb.payments.payment_instructions.PayrollManagementProcessingEventReceived;
+  // adjust the package to your generated class
+
+  public Event fromRecord(ConsumerRecord<String, ?> record) {
+    var avro = (com.chase.ccb.payments.payment_instructions.PayrollManagementProcessingEventReceived) record.value();
+
+    // --- copy headers ---
+    Map<String, String> headers = new HashMap<>();
+    for (Header h : record.headers()) {
+      headers.put(h.key(), new String(h.value(), StandardCharsets.UTF_8));
+    }
+    // add Kafka metadata too (useful for tracing)
+    headers.putIfAbsent("kafka-topic", record.topic());
+    headers.putIfAbsent("kafka-partition", Integer.toString(record.partition()));
+    headers.putIfAbsent("kafka-offset", Long.toString(record.offset()));
+
+    // --- build your Event ---
+    var body = new Event.MessageBody();
+    body.setEventId(avro.getEventIdentifier());                 // String or UUID – keep as String if that’s what your Event expects
+    body.setEventType(avro.getEventTypeName());
+    body.setEntityType(avro.getEntityTypeName());
+    body.setEntityId(avro.getEntityIdentifier());
+    body.setResourceType(avro.getResourceTypeName());
+    body.setResourceUUID(avro.getResourceIdentifier());
+    body.setTimestamp(avro.getEventProcessTimestamp());         // long millis (if your MessageBody has it)
+
+    var event = new Event();
+    event.setHeaders(headers);
+    event.setMessageBody(body);
+
+    return event;
+  }
+}
+
+// package net.jpmchase.payroll.processor.event.consumer.ksaas;
+
+@Slf4j
+@Service
+@AllArgsConstructor
+public class SAFListener {
+
+  private final EventMapper eventMapper;
+  private final EventProcessorService eventProcessorService;
+
+  // Listen to both primary + SAF topics (or just one; up to your config)
+  @KafkaListener(
+      topics = { "${ksas.topics.primary}", "${ksas.topics.saf}" },
+      containerFactory = "avroKafkaListenerContainerFactory"
+  )
+  public void onMessage(ConsumerRecord<String, Object> record, Acknowledgment ack) {
+    try {
+      Event event = eventMapper.fromRecord(record);
+
+      // DEBUG: confirm headers present (incl x-saf, x-idempotency-key, etc.)
+      log.debug("Consumed eventId={} type={} entityType={} headers={}",
+          event.getMessageBody().getEventId(),
+          event.getMessageBody().getEventType(),
+          event.getMessageBody().getEntityType(),
+          safeHeaderKeys(event));
+
+      eventProcessorService.processEvent(event);
+      ack.acknowledge();
+    } catch (Exception e) {
+      log.error("Listener failed for topic={} partition={} offset={} : {}",
+          record.topic(), record.partition(), record.offset(), e.getMessage(), e);
+      // let DefaultErrorHandler handle retries/DLQ. No ack here.
+      throw e;
+    }
+  }
+
+  private static Set<String> safeHeaderKeys(Event e) {
+    return e.getHeaders() == null ? Collections.emptySet() : e.getHeaders().keySet();
+  }
+}
