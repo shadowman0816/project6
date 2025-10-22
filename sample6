@@ -569,3 +569,62 @@ public class SAFListener {
     return e.getHeaders() == null ? Collections.emptySet() : e.getHeaders().keySet();
   }
 }
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class WorkFlowRegistry {
+
+  private final WorkFlowConfig workFlowConfig;
+
+  public List<StepConfig> getStepsForEvent(String entityType, String eventType) {
+    GroupConfig group = workFlowConfig.getGroups().get(entityType);
+    if (group == null) {
+      log.warn("No group config found for entityType '{}'", entityType);
+      return List.of();
+    }
+    List<StepConfig> steps = group.getEvents().get(eventType);
+    if (steps == null || steps.isEmpty()) {
+      log.warn("No steps for eventType '{}' in entityType '{}'", eventType, entityType);
+      return List.of();
+    }
+    // inherit retry/SAF without disturbing order
+    for (StepConfig s : steps) { applyRetry(s, group); applySaf(s, group); }
+    return List.copyOf(steps); // preserves order; unmodifiable
+  }
+
+  public List<String> getOrderedStepNames(String entityType, String eventType) {
+    var steps = getStepsForEvent(entityType, eventType);
+    if (steps.isEmpty()) return List.of();
+    List<String> names = new ArrayList<>(steps.size());
+    for (StepConfig s : steps) names.add(s.getName());
+    return Collections.unmodifiableList(names);
+  }
+
+  public Map<String, Integer> getStepOrderMap(String entityType, String eventType) {
+    var names = getOrderedStepNames(entityType, eventType);
+    Map<String,Integer> order = new HashMap<>(names.size()*2);
+    for (int i=0;i<names.size();i++) order.put(names.get(i), i);
+    return Collections.unmodifiableMap(order);
+  }
+
+  private void applyRetry(StepConfig step, GroupConfig group) {
+    if (!step.isRetryEnabled()) return;
+    if (step.getRetryConfigs() == null) {
+      if (group.isRetryEnabled() && group.getRetryConfigs()!=null) {
+        step.setRetryEnabled(true); step.setRetryConfigs(group.getRetryConfigs());
+      } else if (workFlowConfig.isRetryEnabled() && workFlowConfig.getRetryConfigs()!=null) {
+        step.setRetryEnabled(true); step.setRetryConfigs(workFlowConfig.getRetryConfigs());
+      }
+    }
+  }
+  private void applySaf(StepConfig step, GroupConfig group) {
+    if (!step.isSafEnabled()) return;
+    if (step.getSafConfigs() == null) {
+      if (group.isSafEnabled() && group.getSafConfigs()!=null) {
+        step.setSafEnabled(true); step.setSafConfigs(group.getSafConfigs());
+      } else if (workFlowConfig.isSafEnabled() && workFlowConfig.getSafConfigs()!=null) {
+        step.setSafEnabled(true); step.setSafConfigs(workFlowConfig.getSafConfigs());
+      }
+    }
+  }
+}
