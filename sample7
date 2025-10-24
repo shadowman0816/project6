@@ -160,3 +160,40 @@ public class KsaasListener {
         return bytes == null ? null : new String(bytes, StandardCharsets.UTF_8);
     }
 }
+
+private void postProcess(
+    ConsumerRecord<String, Object> record,
+    Event event,
+    ProcessingResult result
+) {
+
+    boolean saf = isSafReplay(record);
+    boolean cancelMsg = isCancelEvent(event); // e.g. eventType == "payroll.saf.cancel" or entityType == "Payroll" && headers say cancel
+    String publisher = headerValue(record, "x-publisher"); // "EVENT_MANAGER", "RECON_MANAGER", "JOB", etc.
+
+    // 1. SAF replay bookkeeping for Recon
+    if (saf) {
+        String retryId = resolveRetryId(record, event);
+        if (retryId != null && result.isSuccess()) {
+            safelyUpdateRetryStatus(retryId);
+        }
+        // SAF replay usually should NOT republish business side-effects downstream.
+        return;
+    }
+
+    // 2. Cancel/EOD reconciliation message
+    if (cancelMsg) {
+        // This might emit a 'cancel-complete' type event or notify some downstream.
+        outboundPublisher.publishCancellationResult(event, result);
+        return;
+    }
+
+    // 3. First-time Event Manager message (normal processing)
+    // publisher could be EVENT_MANAGER or could be JOB for nightly reconciliation trigger
+    if ("EVENT_MANAGER".equalsIgnoreCase(publisher)) {
+        outboundPublisher.publishBusinessEvent(event, result);
+        return;
+    }
+
+    // 4. Default: do nothing special
+}
