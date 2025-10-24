@@ -1,0 +1,162 @@
+package net.jpmchase.payroll.processor.event.consumer.ksaas;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.header.Header;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Service;
+
+import net.jpmchase.payroll.processor.service.EventProcessorService;
+import net.jpmchase.payroll.processor.saf.RetryScheduleService;
+import net.jpmchase.payroll.processor.event.mapper.EventMapper;
+import net.jpmchase.payroll.processor.event.Event;
+import net.jpmchase.payroll.processor.saf.model.RetryStatus;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+@ConditionalOnProperty(
+    prefix = "kafka.consumers.internal",
+    name = "enabled",
+    havingValue = "true",
+    matchIfMissing = true
+)
+public class KsaasListener {
+
+    private final EventProcessorService eventProcessorService;
+    private final EventMapper eventMapper;
+    private final RetryScheduleService retryScheduleService;
+
+    /**
+     * Single listener for ALL inbound messages on the internal topic:
+     *  - first-time events from Event Manager
+     *  - SAF replay from Recon
+     *  - cancel / EOD from Recon
+     *
+     * We always process the event via EventProcessorService.
+     * We ONLY update retry outbox state if the message is flagged as SAF in headers.
+     */
+    @KafkaListener(
+        topics = "${kafka.consumers.internal.topic}",
+        groupId = "${kafka.consumers.internal.groupId}",
+        containerFactory = "avroKafkaListenerContainerFactory"
+    )
+    public void onMessage(ConsumerRecord<String, Object> record, Acknowledgment ack) {
+        try {
+            // 1. Convert Avro payload + headers -> internal Event model
+            Event event = eventMapper.fromRecord(record);
+
+            // 2. Log (lightweight, no PII)
+            log.debug(
+                "[PROCESSOR LISTENER] Consumed eventId={} type={} entityType={} headers={}",
+                event.getMessageBody().getEventId(),
+                event.getMessageBody().getEventType(),
+                event.getMessageBody().getEntityType(),
+                safeHeaderKeys(record)
+            );
+
+            // 3. Hand off to processor
+            eventProcessorService.processEvent(event);
+
+            // 4. If this is a SAF replay from Recon, update retry status in outbox
+            if (isSafReplay(record)) {
+                // retryId we store is usually either x-idempotency-key (REPLAY:<retryId>)
+                // or we fall back to eventId if that's how you keyed it.
+                String retryId = resolveRetryId(record, event);
+
+                if (retryId != null) {
+                    try {
+                        retryScheduleService.updateRetryStatus(
+                            retryId,
+                            RetryStatus.PROCESSED,
+                            "Successfully replayed via KSaaS"
+                        );
+                        log.info(
+                            "[PROCESSOR LISTENER] SAF replay marked processed retryId={} eventId={}",
+                            retryId,
+                            event.getMessageBody().getEventId()
+                        );
+                    } catch (Exception updateEx) {
+                        // NOTE: we do NOT fail the Kafka ack for bookkeeping errors.
+                        log.error(
+                            "[PROCESSOR LISTENER] Failed to update retry status for retryId={} after processing. {}",
+                            retryId,
+                            updateEx.getMessage(),
+                            updateEx
+                        );
+                    }
+                } else {
+                    log.warn(
+                        "[PROCESSOR LISTENER] SAF replay detected, but retryId could not be resolved. eventId={}",
+                        event.getMessageBody().getEventId()
+                    );
+                }
+            }
+
+            // 5. We've processed successfully, acknowledge the offset
+            ack.acknowledge();
+        } catch (Exception e) {
+            // We *rethrow* so DefaultErrorHandler / DLQ kicks in
+            log.error(
+                "[PROCESSOR LISTENER] Listener failed for topic={} partition={} offset={}: {}",
+                record.topic(),
+                record.partition(),
+                record.offset(),
+                e.getMessage(),
+                e
+            );
+            throw e;
+        }
+    }
+
+    /**
+     * SAF detection rule:
+     * Recon sets header "x-saf" -> "true" for retry replay / reconciliation flows.
+     */
+    private boolean isSafReplay(ConsumerRecord<String, Object> record) {
+        String safVal = headerValue(record, "x-saf");
+        return safVal != null && safVal.equalsIgnoreCase("true");
+    }
+
+    /**
+     * How to pull retryId for marking the row PROCESSED:
+     *   1. Try header "x-idempotency-key" which in recon we format like "REPLAY:<retryId>"
+     *   2. Else, fall back to event.body.eventId (some teams reuse this as pyrl_rtry_id)
+     */
+    private String resolveRetryId(ConsumerRecord<String, Object> record, Event event) {
+        String idem = headerValue(record, "x-idempotency-key");
+        if (idem != null && idem.startsWith("REPLAY:")) {
+            return idem.substring("REPLAY:".length());
+        }
+        // fallback: use the eventId as the retry id
+        return String.valueOf(event.getMessageBody().getEventId());
+    }
+
+    /**
+     * Get all header keys just for debug logs.
+     */
+    private static Set<String> safeHeaderKeys(ConsumerRecord<String, Object> record) {
+        return StreamSupport.stream(record.headers().spliterator(), false)
+            .map(Header::key)
+            .collect(Collectors.toSet());
+    }
+
+    /**
+     * Read a header value as UTF-8 string.
+     */
+    private static String headerValue(ConsumerRecord<String, Object> record, String key) {
+        Header h = record.headers().lastHeader(key);
+        if (h == null) return null;
+        byte[] bytes = h.value();
+        return bytes == null ? null : new String(bytes, StandardCharsets.UTF_8);
+    }
+}
