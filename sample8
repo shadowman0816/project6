@@ -1,0 +1,343 @@
+package net.jpmchase.payroll.processor.service;
+
+import net.jpmchase.payroll.processor.common.config.StepConfig;
+import net.jpmchase.payroll.processor.common.context.WorkflowContext;
+import net.jpmchase.payroll.processor.conditions.ExecutionCondition;
+import net.jpmchase.payroll.processor.exception.ProcessorException;
+import net.jpmchase.payroll.processor.exception.ProcessorExceptionType;
+import net.jpmchase.payroll.processor.model.Event;
+import net.jpmchase.payroll.processor.model.MessageBody;
+import net.jpmchase.payroll.processor.model.enums.EventStatus;
+import net.jpmchase.payroll.processor.registry.ConditionRegistry;
+import net.jpmchase.payroll.processor.registry.WorkFlowRegistry;
+import net.jpmchase.payroll.processor.registry.Steps;
+import net.jpmchase.payroll.processor.retry.RetryScheduleService;
+import net.jpmchase.payroll.processor.saf.SafService; // <-- make sure package matches yours
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class EventProcessorServiceTest {
+
+    @Mock private WorkFlowRegistry workFlowRegistry;
+    @Mock private Steps stepRegistry;
+    @Mock private ConditionRegistry conditionRegistry;
+    @Mock private RetryScheduleService retryScheduleService;
+    @Mock private SafService safService;
+
+    @InjectMocks
+    private EventProcessorService service;
+
+    /** helper to build a minimal Event */
+    private Event buildMockEvent(String entityType, String eventType) {
+        MessageBody body = new MessageBody();
+        body.setEntityType(entityType);
+        body.setEventType(eventType);
+        body.setEventId(UUID.randomUUID());
+        body.setResourceUUID(UUID.randomUUID());
+
+        Event e = new Event();
+        e.setMessageBody(body);
+        e.setProcessingStatus(EventStatus.IN_PROCESS);
+        e.setEventLogId(UUID.randomUUID());
+        e.setHeaders(Collections.emptyMap()); // SAF seed will look at headers
+        return e;
+    }
+
+    /* ------------------------------------------------------------------
+       NEW TEST 1:
+       Verify safService.seed(...) is called at the start of processEvent()
+       and normal happy-path step is still executed.
+     ------------------------------------------------------------------ */
+    @Test
+    void test_processEvent_invokesSafSeed_andExecutesStep() {
+        String entityType = "ENTITY";
+        String eventType  = "EVENT";
+        Event event = buildMockEvent(entityType, eventType);
+
+        // arrange workflow: single non-retry step
+        StepConfig stepConfig = new StepConfig();
+        stepConfig.setName("mockStep");
+        stepConfig.setRetryEnabled(false); // no loop/retry logic
+
+        when(workFlowRegistry.getStepsForEvent(entityType, eventType))
+            .thenReturn(List.of(stepConfig));
+
+        // stepRegistry.get("mockStep") -> mock step impl
+        net.jpmchase.payroll.processor.steps.Step mockStep = mock(net.jpmchase.payroll.processor.steps.Step.class);
+        when(stepRegistry.get("mockStep")).thenReturn(mockStep);
+
+        // SAF should allow execution in this scenario
+        when(safService.shouldExecute(
+                eq("mockStep"),
+                any(),                // executeOnCondition
+                same(event),
+                any()                 // baseCondition supplier
+        )).thenReturn(true);
+
+        // conditionRegistry won't be called if baseCondition short-circuits via safService.shouldExecute(...)
+        // but let's just not blow up if it is:
+        when(conditionRegistry.get(anyString())).thenReturn(mock(ExecutionCondition.class));
+
+        // act
+        service.processEvent(event);
+
+        // assert 1: safService.seed was called with the same Event and some WorkflowContext
+        ArgumentCaptor<WorkflowContext> ctxCaptor = ArgumentCaptor.forClass(WorkflowContext.class);
+        verify(safService).seed(same(event), ctxCaptor.capture());
+
+        WorkflowContext seededCtx = ctxCaptor.getValue();
+        // sanity check: after seeding, context should have INITIATED or IN_PROCESS, etc.
+        // We know processEvent() does:
+        //   context.setStatus(INITIATED);
+        //   context.put(EVENT, event);
+        //   ...
+        // So we can assert status got initialized:
+        assertEquals("INITIATED", seededCtx.getStatus().name());
+
+        // assert 2: our step actually executed once
+        verify(mockStep, times(1)).execute(any(WorkflowContext.class));
+    }
+
+    /* ------------------------------------------------------------------
+       NEW TEST 2:
+       SAF says "skip this step" -> step should NOT execute.
+       This exercises the branch in executeStepWithRetry() where
+       safService.shouldExecute(...) returns false.
+     ------------------------------------------------------------------ */
+    @Test
+    void test_processEvent_skipsStep_whenSafBlocksExecution() {
+        String entityType = "ENTITY";
+        String eventType  = "EVENT";
+        Event event = buildMockEvent(entityType, eventType);
+
+        StepConfig stepConfig = new StepConfig();
+        stepConfig.setName("safBlockedStep");
+        stepConfig.setRetryEnabled(false);
+
+        when(workFlowRegistry.getStepsForEvent(entityType, eventType))
+            .thenReturn(List.of(stepConfig));
+
+        net.jpmchase.payroll.processor.steps.Step mockStep =
+            mock(net.jpmchase.payroll.processor.steps.Step.class);
+        when(stepRegistry.get("safBlockedStep")).thenReturn(mockStep);
+
+        // SAF vetoes execution
+        when(safService.shouldExecute(
+                eq("safBlockedStep"),
+                any(),
+                same(event),
+                any()
+        )).thenReturn(false);
+
+        service.processEvent(event);
+
+        // SAF seed still gets called
+        verify(safService).seed(any(Event.class), any(WorkflowContext.class));
+
+        // mockStep should never run because SAF said don't execute
+        verify(mockStep, never()).execute(any());
+    }
+
+    /* ------------------------------------------------------------------
+       EXISTING behaviors below (adapted from your screenshots).
+       I’ll restate / modernize a couple of them to keep the file coherent.
+     ------------------------------------------------------------------ */
+
+    @Test
+    void test_processEvent_noStepsFound() {
+        String entityType = "ENTITY";
+        String eventType  = "EVENT";
+        Event event = buildMockEvent(entityType, eventType);
+
+        when(workFlowRegistry.getStepsForEvent(entityType, eventType))
+            .thenReturn(Collections.emptyList());
+
+        service.processEvent(event);
+
+        // safService.seed still called
+        verify(safService).seed(any(Event.class), any(WorkflowContext.class));
+
+        // nothing else to verify really except we did hit registry once
+        verify(workFlowRegistry, times(1))
+            .getStepsForEvent(entityType, eventType);
+    }
+
+    @Test
+    void test_executeStep_stepExecutesSuccessfully() throws Exception {
+        String entityType = "ENTITY";
+        String eventType  = "EVENT";
+        Event event = buildMockEvent(entityType, eventType);
+
+        StepConfig stepConfig = new StepConfig();
+        stepConfig.setName("mockStep");
+        stepConfig.setRetryEnabled(false);
+
+        when(workFlowRegistry.getStepsForEvent(entityType, eventType))
+            .thenReturn(List.of(stepConfig));
+
+        net.jpmchase.payroll.processor.steps.Step mockStep =
+            mock(net.jpmchase.payroll.processor.steps.Step.class);
+        when(stepRegistry.get("mockStep")).thenReturn(mockStep);
+
+        when(safService.shouldExecute(
+                eq("mockStep"),
+                any(),
+                same(event),
+                any()
+        )).thenReturn(true);
+
+        service.processEvent(event);
+
+        // executed once
+        verify(mockStep, times(1)).execute(any(WorkflowContext.class));
+        // no retry scheduling for success
+        verifyNoInteractions(retryScheduleService);
+    }
+
+    @Test
+    void test_executeStep_stepFailsAndRetriesSuccessfully() throws Exception {
+        String entityType = "ENTITY";
+        String eventType  = "RETRY_EVENT";
+        Event event = buildMockEvent(entityType, eventType);
+
+        StepConfig stepConfig = new StepConfig();
+        stepConfig.setName("retryStep");
+        stepConfig.setRetryEnabled(true);
+        StepConfig.RetryConfig retryCfg = new StepConfig.RetryConfig();
+        retryCfg.setMaxRetryCount(2);
+        retryCfg.setRetryBackOffMs("10");
+        stepConfig.setRetryConfigs(retryCfg);
+
+        when(workFlowRegistry.getStepsForEvent(entityType, eventType))
+            .thenReturn(List.of(stepConfig));
+
+        net.jpmchase.payroll.processor.steps.Step mockStep =
+            mock(net.jpmchase.payroll.processor.steps.Step.class);
+
+        // First call throws SYSTEM_RETRYABLE, second call succeeds
+        doThrow(new ProcessorException(
+                    ProcessorExceptionType.SYSTEM_RETRYABLE,
+                    "temporary",
+                    "retryable"))
+            .doNothing()
+            .when(mockStep).execute(any(WorkflowContext.class));
+
+        when(stepRegistry.get("retryStep")).thenReturn(mockStep);
+
+        when(safService.shouldExecute(
+                eq("retryStep"),
+                any(),
+                same(event),
+                any()
+        )).thenReturn(true);
+
+        service.processEvent(event);
+
+        // step.execute called twice (retry once, then success)
+        verify(mockStep, times(2)).execute(any(WorkflowContext.class));
+
+        // for SYSTEM_RETRYABLE we expect scheduleRetry(...) to be called only
+        // AFTER final failure and only if safEnabled on that step; but in this
+        // test the second attempt succeeds, so no scheduleRetry
+        verifyNoInteractions(retryScheduleService);
+    }
+
+    @Test
+    void test_executeStep_failsFatally_noRetry() throws Exception {
+        String entityType = "ENTITY";
+        String eventType  = "FATAL_EVENT";
+        Event event = buildMockEvent(entityType, eventType);
+
+        StepConfig stepConfig = new StepConfig();
+        stepConfig.setName("fatalStep");
+        stepConfig.setRetryEnabled(true);
+        StepConfig.RetryConfig retryCfg = new StepConfig.RetryConfig();
+        retryCfg.setMaxRetryCount(1);
+        retryCfg.setRetryBackOffMs("10");
+        stepConfig.setRetryConfigs(retryCfg);
+
+        when(workFlowRegistry.getStepsForEvent(entityType, eventType))
+            .thenReturn(List.of(stepConfig));
+
+        net.jpmchase.payroll.processor.steps.Step mockStep =
+            mock(net.jpmchase.payroll.processor.steps.Step.class);
+
+        doThrow(new ProcessorException(
+                    ProcessorExceptionType.FATAL,
+                    "failure",
+                    "fatal"))
+            .when(mockStep).execute(any(WorkflowContext.class));
+
+        when(stepRegistry.get("fatalStep")).thenReturn(mockStep);
+
+        when(safService.shouldExecute(
+                eq("fatalStep"),
+                any(),
+                same(event),
+                any()
+        )).thenReturn(true);
+
+        service.processEvent(event);
+
+        // execute called once (fatal stops loop)
+        verify(mockStep, times(1)).execute(any(WorkflowContext.class));
+
+        // no retry scheduled on FATAL
+        verifyNoInteractions(retryScheduleService);
+    }
+
+    @Test
+    void test_shouldExecute_returnsFalse_whenConditionFails() {
+        String entityType = "ENTITY";
+        String eventType  = "COND_EVENT";
+        Event event = buildMockEvent(entityType, eventType);
+
+        StepConfig stepConfig = new StepConfig();
+        stepConfig.setName("conditionalStep");
+        stepConfig.setExecuteOnCondition("myCondition");
+        stepConfig.setRetryEnabled(false);
+
+        when(workFlowRegistry.getStepsForEvent(entityType, eventType))
+            .thenReturn(List.of(stepConfig));
+
+        // SAF says "yes, you MAY run this step" so we defer to condition
+        when(safService.shouldExecute(
+                eq("conditionalStep"),
+                eq("myCondition"),
+                same(event),
+                any()
+        )).thenAnswer(invocation -> {
+            // call the BooleanSupplier (4th arg) ourselves to mimic real flow
+            BooleanSupplier base = invocation.getArgument(3, BooleanSupplier.class);
+            return base.getAsBoolean(); // just delegate to condition logic
+        });
+
+        // mock conditionRegistry -> condition.evaluate() returns false
+        ExecutionCondition condition = mock(ExecutionCondition.class);
+        when(condition.evaluate(any())).thenReturn(false);
+        when(conditionRegistry.get("myCondition")).thenReturn(condition);
+
+        // act
+        service.processEvent(event);
+
+        // assert:
+        //  - condition evaluated once
+        //  - step NEVER executed
+        verify(condition, times(1)).evaluate(any(WorkflowContext.class));
+        verify(stepRegistry.get("conditionalStep"), never()).execute(any());
+    }
+}
