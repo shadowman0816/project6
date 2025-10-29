@@ -341,3 +341,262 @@ class EventProcessorServiceTest {
         verify(stepRegistry.get("conditionalStep"), never()).execute(any());
     }
 }
+package net.jpmchase.payroll.processor.service;
+
+import net.jpmchase.payroll.processor.common.context.WorkflowContext;
+import net.jpmchase.payroll.processor.model.Event;
+import net.jpmchase.payroll.processor.model.MessageBody;
+import net.jpmchase.payroll.processor.retry.RetryOutboxEntity;
+import net.jpmchase.payroll.processor.registry.WorkFlowRegistry;
+import net.jpmchase.payroll.processor.service.SafService.SafMode;
+import net.jpmchase.payroll.processor.service.SafTemplateProvider.SafDecision;
+import net.jpmchase.payroll.processor.service.RetryScheduleService;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.util.*;
+
+import static net.jpmchase.payroll.processor.service.SafService.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.*;
+
+/**
+ * Unit tests for SafService.
+ * Focus:
+ *  - seed(event, ctx)
+ *  - shouldExecute(stepName, event, ctx)
+ */
+@ExtendWith(MockitoExtension.class)
+class SafServiceTest {
+
+    @Mock
+    private WorkFlowRegistry workFlowRegistry;
+
+    @Mock
+    private SafTemplateProvider safTemplateProvider;
+
+    @Mock
+    private RetryScheduleService retryScheduleService;
+
+    @InjectMocks
+    private SafService safService;
+
+    private Event event;
+    private WorkflowContext ctx;
+    private MessageBody body;
+
+    @BeforeEach
+    void setup() {
+        // Build a minimal Event + MessageBody like processor actually sees.
+        body = new MessageBody();
+        body.setEntityType("Payroll");
+        body.setEventType("payroll.processed");
+        body.setEventId(UUID.randomUUID().toString());
+        body.setResourceUUID(UUID.randomUUID());
+
+        // headers map is what SafUtil.isSafEnabled(event) reads.
+        Map<String, String> headers = new HashMap<>();
+        // default to SAF ON unless overridden in each test
+        headers.put("x-saf", "true");
+
+        event = new Event();
+        event.setMessageBody(body);
+        event.setHeaders(headers);
+
+        ctx = new WorkflowContext();
+    }
+
+    /* ------------------------- seed(...) tests ------------------------- */
+
+    @Test
+    void seed_whenSafDisabled_setsFlagAndReturnsEarly() {
+        // given SAF header false
+        event.getHeaders().put("x-saf", "false");
+
+        // when
+        safService.seed(event, ctx);
+
+        // then
+        // SAF_ENABLED=false and nothing else in context
+        assertThat(ctx.get(SAF_ENABLED)).isEqualTo(Boolean.FALSE);
+        assertThat(ctx.get(SAF_MODE)).isNull();
+        assertThat(ctx.get(SAF_TARGET)).isNull();
+        assertThat(ctx.get(SAF_SKIP_UNTIL)).isNull();
+        assertThat(ctx.get(SAF_SKIP_SET)).isNull();
+        assertThat(ctx.get(SAF_INCLUDE_SET)).isNull();
+
+        // and we never hit DB/template
+        verifyNoInteractions(retryScheduleService, safTemplateProvider);
+    }
+
+    @Test
+    void seed_whenSafEnabled_butNoRetryOutboxRow_setsEnabledAndExits() {
+        // SAF header already true from @BeforeEach
+        // retryScheduleService returns empty
+        when(retryScheduleService.getFailedStepFromRetryOutbox(anyString()))
+            .thenReturn(Optional.empty());
+
+        safService.seed(event, ctx);
+
+        assertThat(ctx.get(SAF_ENABLED)).isEqualTo(Boolean.TRUE);
+
+        // no SAF metadata added because we couldn't resolve failed step
+        assertThat(ctx.get(SAF_MODE)).isNull();
+        assertThat(ctx.get(SAF_TARGET)).isNull();
+        assertThat(ctx.get(SAF_SKIP_UNTIL)).isNull();
+        assertThat(ctx.get(SAF_SKIP_SET)).isNull();
+        assertThat(ctx.get(SAF_INCLUDE_SET)).isNull();
+
+        verify(retryScheduleService).getFailedStepFromRetryOutbox(body.getEventId());
+        verifyNoInteractions(safTemplateProvider);
+    }
+
+    @Test
+    void seed_whenTemplateDisabled_doesNotPopulatePolicy() {
+        // given retryOutbox row found
+        RetryOutboxEntity row = new RetryOutboxEntity();
+        row.setStepName("PersistPayrollHierarchyToDatabase");
+        when(retryScheduleService.getFailedStepFromRetryOutbox(anyString()))
+            .thenReturn(Optional.of(row));
+
+        // but template returned is disabled
+        SafDecision disabledDecision = mock(SafDecision.class);
+        when(disabledDecision.isEnabled()).thenReturn(false);
+        when(safTemplateProvider.getTemplate(
+                eq("Payroll"),
+                eq("payroll.processed"),
+                eq("PersistPayrollHierarchyToDatabase")))
+            .thenReturn(disabledDecision);
+
+        safService.seed(event, ctx);
+
+        // SAF_ENABLED true, but nothing else because decision disabled
+        assertThat(ctx.get(SAF_ENABLED)).isEqualTo(Boolean.TRUE);
+        assertThat(ctx.get(SAF_MODE)).isNull();
+        assertThat(ctx.get(SAF_TARGET)).isNull();
+        assertThat(ctx.get(SAF_SKIP_UNTIL)).isNull();
+        assertThat(ctx.get(SAF_SKIP_SET)).isNull();
+        assertThat(ctx.get(SAF_INCLUDE_SET)).isNull();
+    }
+
+    @Test
+    void seed_whenTemplateEnabled_populatesAllContextKeys() {
+        // given retryOutbox row w/ failed step
+        RetryOutboxEntity row = new RetryOutboxEntity();
+        row.setStepName("PersistPayrollHierarchyToDatabase");
+        when(retryScheduleService.getFailedStepFromRetryOutbox(anyString()))
+            .thenReturn(Optional.of(row));
+
+        // and SAF template decision is enabled
+        SafDecision decision = mock(SafDecision.class);
+        when(decision.isEnabled()).thenReturn(true);
+        when(decision.getStartPolicy()).thenReturn(SafMode.RETRY_FROM_FAILED); // enum
+        when(decision.getTargetStep()).thenReturn("PersistPayrollHierarchyToDatabase");
+        when(decision.getSkipUntilStep()).thenReturn("GeneratePIMIdentifier");
+        when(decision.getSkipSteps()).thenReturn(List.of("GeneratePIMIdentifier", "PersistPayrollHierarchyToDatabase"));
+        when(decision.getIncludeSteps()).thenReturn(List.of("GustoDisbursementReconciliationForPayroll"));
+
+        when(safTemplateProvider.getTemplate(
+                eq("Payroll"),
+                eq("payroll.processed"),
+                eq("PersistPayrollHierarchyToDatabase")))
+            .thenReturn(decision);
+
+        safService.seed(event, ctx);
+
+        assertThat(ctx.get(SAF_ENABLED)).isEqualTo(Boolean.TRUE);
+        assertThat(ctx.get(SAF_MODE)).isEqualTo(SafMode.RETRY_FROM_FAILED.name());
+        assertThat(ctx.get(SAF_TARGET)).isEqualTo("PersistPayrollHierarchyToDatabase");
+        assertThat(ctx.get(SAF_SKIP_UNTIL)).isEqualTo("GeneratePIMIdentifier");
+
+        // skip list and include list are stored as comma-separated strings
+        assertThat(ctx.get(SAF_SKIP_SET)).isEqualTo(
+            "GeneratePIMIdentifier,PersistPayrollHierarchyToDatabase"
+        );
+        assertThat(ctx.get(SAF_INCLUDE_SET)).isEqualTo(
+            "GustoDisbursementReconciliationForPayroll"
+        );
+    }
+
+    /* ------------------------- shouldExecute(...) tests ------------------------- */
+
+    @Test
+    void shouldExecute_whenSafDisabled_returnsTrue() {
+        // SAF not enabled in ctx
+        ctx.put(SAF_ENABLED, Boolean.FALSE);
+
+        boolean result = safService.shouldExecute("AnyStep", event, ctx);
+
+        assertThat(result).isTrue();
+    }
+
+    @Test
+    void shouldExecute_retryFromFailed_honorsIncludeSteps() {
+        // SAF enabled
+        ctx.put(SAF_ENABLED, Boolean.TRUE);
+        ctx.put(SAF_MODE, SafMode.RETRY_FROM_FAILED.name());
+        ctx.put(SAF_INCLUDE_SET, "StepA,StepB"); // only these allowed
+        ctx.put(SAF_TARGET, "DoesNotMatterHere");
+
+        boolean execA = safService.shouldExecute("StepA", event, ctx);
+        boolean execX = safService.shouldExecute("StepX", event, ctx);
+
+        assertThat(execA).isTrue();   // included
+        assertThat(execX).isFalse();  // not included
+    }
+
+    @Test
+    void shouldExecute_retryFromFailed_afterTargetStepOrdering() {
+        // SAF enabled, no include list
+        ctx.put(SAF_ENABLED, Boolean.TRUE);
+        ctx.put(SAF_MODE, SafMode.RETRY_FROM_FAILED.name());
+        ctx.put(SAF_TARGET, "Step2");
+
+        // workflow order returned by registry
+        when(workFlowRegistry.getOrderedStepNames("Payroll","payroll.processed"))
+            .thenReturn(List.of("Step1","Step2","Step3","Step4"));
+
+        boolean exec1 = safService.shouldExecute("Step1", event, ctx); // before pivot
+        boolean exec2 = safService.shouldExecute("Step2", event, ctx); // pivot
+        boolean exec3 = safService.shouldExecute("Step3", event, ctx); // after pivot
+
+        assertThat(exec1).isFalse();
+        assertThat(exec2).isTrue();
+        assertThat(exec3).isTrue();
+    }
+
+    @Test
+    void shouldExecute_startWithSkip_skipsNamedAndBeforeSkipUntil() {
+        // SAF enabled
+        ctx.put(SAF_ENABLED, Boolean.TRUE);
+        ctx.put(SAF_MODE, SafMode.START_WITH_SKIP.name());
+        ctx.put(SAF_SKIP_UNTIL, "Step3");
+        ctx.put(SAF_SKIP_SET, "StepX,StepY");
+
+        when(workFlowRegistry.getOrderedStepNames("Payroll","payroll.processed"))
+            .thenReturn(List.of("Step1","Step2","Step3","Step4","StepX","StepY"));
+
+        boolean execStep1 = safService.shouldExecute("Step1", event, ctx); // before Step3
+        boolean execStep3 = safService.shouldExecute("Step3", event, ctx); // pivot or after
+        boolean execSkipX = safService.shouldExecute("StepX", event, ctx); // explicitly skipped
+
+        assertThat(execStep1).isFalse();   // before pivot -> false
+        assertThat(execStep3).isTrue();    // pivot and after -> true
+        assertThat(execSkipX).isFalse();   // explicit skip list wins
+    }
+
+    @Test
+    void shouldExecute_defaultMode_returnsTrue() {
+        // SAF enabled but mode not matched (e.g. START_FROM_FIRST)
+        ctx.put(SAF_ENABLED, Boolean.TRUE);
+        ctx.put(SAF_MODE, SafMode.START_FROM_FIRST.name());
+
+        boolean exec = safService.shouldExecute("Whatever", event, ctx);
+
+        assertThat(exec).isTrue();
+    }
+}
