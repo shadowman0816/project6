@@ -1,4 +1,4 @@
-package net.jpmchase.payroll.processor.service;
+no package net.jpmchase.payroll.processor.service;
 
 import net.jpmchase.payroll.processor.common.config.StepConfig;
 import net.jpmchase.payroll.processor.common.context.WorkflowContext;
@@ -598,5 +598,197 @@ class SafServiceTest {
         boolean exec = safService.shouldExecute("Whatever", event, ctx);
 
         assertThat(exec).isTrue();
+    }
+}
+
+package net.jpmchase.payroll.processor.conditions.payroll;
+
+import net.jpmchase.payroll.processor.common.context.WorkflowContext;
+import net.jpmchase.payroll.processor.remote.pim.model.TransactionIdentifiers;
+import net.jpmchase.payroll.processor.repository.mgmt.entity.contractor.payment.ContractorPaymentEntity;
+import net.jpmchase.payroll.processor.repository.mgmt.entity.contractor.payment.ContractorPaymentGroupEntity;
+import net.jpmchase.payroll.processor.repository.mgmt.entity.contractor.payment.ContractorPaymentId;
+import net.jpmchase.payroll.processor.service.ContractorPaymentService;
+import net.jpmchase.payroll.processor.utils.AppConstants;
+import net.jpmchase.payroll.processor.utils.PaymentTypeUtil;
+import org.junit.jupiter.api.*;
+import org.mockito.MockedStatic;
+
+import java.lang.reflect.Method;
+import java.util.*;
+
+import static net.jpmchase.payroll.processor.utils.WorkflowContextUtil.*;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+class PaymentPIMIdentifierMissingConditionTest {
+
+    private ContractorPaymentService contractorPaymentService;
+    private PaymentPIMIdentifierMissingCondition condition;
+    private WorkflowContext context;
+
+    @BeforeEach
+    void setup() {
+        contractorPaymentService = mock(ContractorPaymentService.class);
+        condition = new PaymentPIMIdentifierMissingCondition(contractorPaymentService);
+        context = new WorkflowContext();
+    }
+
+    @AfterEach
+    void tearDown() {
+        // Defensive: clears any inline/static mocks in case a test bails early
+        org.mockito.Mockito.framework().clearInlineMocks();
+    }
+
+    @Test
+    void testEvaluate_PaymentPinIdentifierNull_ReturnsTrue() {
+        ContractorPaymentGroupEntity group = mock(ContractorPaymentGroupEntity.class);
+        when(group.getSrcCntrPymtGrpId()).thenReturn(null);
+
+        context.put(GROUP_PAYMENT_ENTITY, group);
+
+        assertTrue(condition.evaluate(context));
+        assertNull(context.get(TRANSACTION_IDENTIFIER_LIST, List.class));
+    }
+
+    @Test
+    void testEvaluate_ValidPinIdentifier_NoPayments_ReturnsFalseAndTxnIdsNull() {
+        ContractorPaymentGroupEntity group = mock(ContractorPaymentGroupEntity.class);
+        when(group.getSrcCntrPymtGrpId()).thenReturn("PIM123");
+        context.put(GROUP_PAYMENT_ENTITY, group);
+
+        when(contractorPaymentService.getContractorPaymentsForGroupId("GROUP1"))
+                .thenReturn(Collections.emptyList());
+        context.put(GROUP_PAYMENT_ID, "GROUP1");
+
+        try (MockedStatic<PaymentTypeUtil> mocked = mockStatic(PaymentTypeUtil.class)) {
+            mocked.when(() -> PaymentTypeUtil.isNotCheckPaymentType("ACH")).thenReturn(true);
+
+            boolean result = condition.evaluate(context);
+            assertFalse(result);
+            assertNull(context.get(TRANSACTION_IDENTIFIER_LIST, List.class));
+        }
+    }
+
+    @Test
+    void testEvaluate_ValidPinIdentifier_PaymentsWithNoTxnIds_ReturnsFalseAndTransactionIdentifiersNull() {
+        ContractorPaymentGroupEntity group = mock(ContractorPaymentGroupEntity.class);
+        when(group.getSrcCntrPymtGrpId()).thenReturn("PIM123");
+        context.put(GROUP_PAYMENT_ENTITY, group);
+
+        // Two ACH payments but no instrument detail IDs
+        ContractorPaymentId debitId = mock(ContractorPaymentId.class);
+        when(debitId.getDrCrCd()).thenReturn(AppConstants.TXN_DEBIT_CD);
+        ContractorPaymentEntity debit = mock(ContractorPaymentEntity.class);
+        when(debit.getTxnModeCd()).thenReturn("ACH");
+        when(debit.getId()).thenReturn(debitId);
+        when(debit.getSrcPymtInstrDtlId()).thenReturn(null);
+
+        ContractorPaymentId creditId = mock(ContractorPaymentId.class);
+        when(creditId.getDrCrCd()).thenReturn(AppConstants.TXN_CREDIT_CD);
+        ContractorPaymentEntity credit = mock(ContractorPaymentEntity.class);
+        when(credit.getTxnModeCd()).thenReturn("ACH");
+        when(credit.getId()).thenReturn(creditId);
+        when(credit.getSrcPymtInstrDtlId()).thenReturn(null);
+
+        when(contractorPaymentService.getContractorPaymentsForGroupId("GROUP1"))
+                .thenReturn(List.of(debit, credit));
+        context.put(GROUP_PAYMENT_ID, "GROUP1");
+
+        try (MockedStatic<PaymentTypeUtil> mocked = mockStatic(PaymentTypeUtil.class)) {
+            mocked.when(() -> PaymentTypeUtil.isNotCheckPaymentType("ACH")).thenReturn(true);
+
+            boolean result = condition.evaluate(context);
+            assertFalse(result);
+            assertNull(context.get(TRANSACTION_IDENTIFIER_LIST, List.class));
+        }
+    }
+
+    @Test
+    void testEvaluate_ValidPinIdentifier_PaymentsWithDebitAndCreditTxnIds_ReturnsFalseAndTransactionIdentifiersPopulated() {
+        ContractorPaymentGroupEntity group = mock(ContractorPaymentGroupEntity.class);
+        when(group.getSrcCntrPymtGrpId()).thenReturn("PIM123");
+        context.put(GROUP_PAYMENT_ENTITY, group);
+
+        // Debit with ID
+        ContractorPaymentId debitId = mock(ContractorPaymentId.class);
+        when(debitId.getDrCrCd()).thenReturn(AppConstants.TXN_DEBIT_CD);
+        ContractorPaymentEntity debit = mock(ContractorPaymentEntity.class);
+        when(debit.getTxnModeCd()).thenReturn("ACH");
+        when(debit.getId()).thenReturn(debitId);
+        when(debit.getSrcPymtInstrDtlId()).thenReturn("DEBIT_TXN_1");
+
+        // Credit with ID
+        ContractorPaymentId creditId = mock(ContractorPaymentId.class);
+        when(creditId.getDrCrCd()).thenReturn(AppConstants.TXN_CREDIT_CD);
+        ContractorPaymentEntity credit = mock(ContractorPaymentEntity.class);
+        when(credit.getTxnModeCd()).thenReturn("ACH");
+        when(credit.getId()).thenReturn(creditId);
+        when(credit.getSrcPymtInstrDtlId()).thenReturn("CREDIT_TXN_1");
+
+        when(contractorPaymentService.getContractorPaymentsForGroupId("GROUP1"))
+                .thenReturn(List.of(debit, credit));
+        context.put(GROUP_PAYMENT_ID, "GROUP1");
+
+        try (MockedStatic<PaymentTypeUtil> mocked = mockStatic(PaymentTypeUtil.class)) {
+            mocked.when(() -> PaymentTypeUtil.isNotCheckPaymentType("ACH")).thenReturn(true);
+
+            boolean result = condition.evaluate(context);
+            assertFalse(result);
+
+            @SuppressWarnings("unchecked")
+            List<TransactionIdentifiers> list =
+                    context.get(TRANSACTION_IDENTIFIER_LIST, List.class);
+            assertNotNull(list);
+            assertEquals(1, list.size());
+            TransactionIdentifiers ti = list.get(0);
+
+            assertEquals("PIM123", ti.getTransactionIdentifier());
+            assertEquals(List.of("DEBIT_TXN_1"), ti.getDebitTransactionIdentifiers());
+            assertEquals(List.of("CREDIT_TXN_1"), ti.getCreditTransactionIdentifiers());
+            assertEquals(1, ti.getDebitRecordCount());
+            assertEquals(1, ti.getCreditRecordCount());
+        }
+    }
+
+    // --- Private-method coverage (reflection) ---
+
+    @Test
+    void testExtractTransactionIds_EntitiesNull_ReturnsEmptyList() throws Exception {
+        List<String> ids = invokeExtractTransactionIds(null, AppConstants.TXN_DEBIT_CD);
+        assertTrue(ids.isEmpty());
+    }
+
+    @Test
+    void testExtractTransactionIds_EntitiesWithNullOrEmptyTxnId_FilteredOut() throws Exception {
+        ContractorPaymentId id = mock(ContractorPaymentId.class);
+        when(id.getDrCrCd()).thenReturn(AppConstants.TXN_DEBIT_CD);
+
+        ContractorPaymentEntity e1 = mock(ContractorPaymentEntity.class);
+        when(e1.getTxnModeCd()).thenReturn("ACH");
+        when(e1.getId()).thenReturn(id);
+        when(e1.getSrcPymtInstrDtlId()).thenReturn(null);
+
+        ContractorPaymentEntity e2 = mock(ContractorPaymentEntity.class);
+        when(e2.getTxnModeCd()).thenReturn("ACH");
+        when(e2.getId()).thenReturn(id);
+        when(e2.getSrcPymtInstrDtlId()).thenReturn("");
+
+        try (MockedStatic<PaymentTypeUtil> mocked = mockStatic(PaymentTypeUtil.class)) {
+            mocked.when(() -> PaymentTypeUtil.isNotCheckPaymentType("ACH")).thenReturn(true);
+            List<String> ids = invokeExtractTransactionIds(List.of(e1, e2), AppConstants.TXN_DEBIT_CD);
+            assertTrue(ids.isEmpty());
+        }
+    }
+
+    // -------- helpers --------
+
+    @SuppressWarnings("unchecked")
+    private List<String> invokeExtractTransactionIds(List<ContractorPaymentEntity> entities, char drCr)
+            throws Exception {
+        Method m = PaymentPIMIdentifierMissingCondition.class
+                .getDeclaredMethod("extractTransactionIds", List.class, Character.TYPE);
+        m.setAccessible(true);
+        return (List<String>) m.invoke(condition, entities, drCr);
     }
 }
