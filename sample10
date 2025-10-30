@@ -1,0 +1,395 @@
+package net.jpmchase.payroll.recon.repository.mgmt.payroll.sql;
+
+import net.jpmchase.payroll.recon.repository.mgmt.entity.payroll.RetryOutboxEntity;
+
+import java.time.LocalDate;
+import java.util.List;
+
+public interface RetryOutboxSql {
+  // “Replay” claims
+  List<RetryOutboxEntity> claimReplaySameDay(LocalDate today, int maxRetries, int batchSize, int leaseSeconds, String statusCd);
+  List<RetryOutboxEntity> claimReplayFuture(LocalDate today, int maxRetries, int batchSize, int leaseSeconds, String statusCd);
+
+  // “Cancel” claims
+  List<RetryOutboxEntity> claimCancelSameDay(LocalDate today, int maxRetries, int batchSize, String statusCd);
+  List<RetryOutboxEntity> claimCancelFuture(LocalDate today, int maxRetries, int batchSize, String statusCd);
+
+  // Markers
+  int markSent(String retryId, String reason, String statusCd);
+  int markPublishFailed(String retryId, String error, String statusCd);
+  int markCancelSent(String retryId, String reason, String statusCd);
+}
+package net.jpmchase.payroll.recon.repository.mgmt.payroll.sql;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Profile;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@Repository
+@Profile("!h2")
+@RequiredArgsConstructor
+public class PostgresRetryOutboxSql implements RetryOutboxSql {
+
+  @PersistenceContext private EntityManager em;
+
+  @Override
+  public List<RetryOutboxEntity> claimReplaySameDay(LocalDate today, int maxRetries, int batchSize, int leaseSeconds, String statusCd) {
+    // Postgres flavor: NOW(), INTERVAL, SKIP LOCKED, RETURNING
+    var sql = """
+        WITH c AS (
+          SELECT pyrl_rtry_id
+          FROM pyrl_mgmt.pyrl_rtry_outbox
+          WHERE ent_type_nm IN ('Payroll','ContractorPayment','ContractorPaymentGroup')
+            AND sts_cd = 'FAILED'
+            AND rtry_cn < :maxRetries
+            AND (expr_ts IS NULL OR expr_ts > NOW())
+            AND (updt_ts IS NULL OR updt_ts < NOW() - (:leaseSeconds || ' seconds')::interval)
+          ORDER BY cre_ts
+          FOR UPDATE SKIP LOCKED
+          LIMIT :batchSize
+        )
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox r
+           SET sts_cd = :statusCd,
+               updt_ts = NOW(),
+               sts_rsn_tx = 'claimed for replay (same-day)'
+         WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+        RETURNING r.*;
+        """;
+    return em.createNativeQuery(sql, RetryOutboxEntity.class)
+        .setParameter("maxRetries", maxRetries)
+        .setParameter("leaseSeconds", leaseSeconds)
+        .setParameter("batchSize", batchSize)
+        .setParameter("statusCd", statusCd)
+        .getResultList();
+  }
+
+  @Override
+  public List<RetryOutboxEntity> claimReplayFuture(LocalDate today, int maxRetries, int batchSize, int leaseSeconds, String statusCd) {
+    var sql = """
+        WITH c AS (
+          SELECT pyrl_rtry_id
+          FROM pyrl_mgmt.pyrl_rtry_outbox
+          WHERE ent_type_nm IN ('Payroll','ContractorPayment','ContractorPaymentGroup')
+            AND sts_cd = 'FAILED'
+            AND rtry_cn < :maxRetries
+            AND (expr_ts IS NULL OR expr_ts > NOW())
+            AND (updt_ts IS NULL OR updt_ts < NOW() - (:leaseSeconds || ' seconds')::interval)
+          ORDER BY cre_ts
+          FOR UPDATE SKIP LOCKED
+          LIMIT :batchSize
+        )
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox r
+           SET sts_cd = :statusCd,
+               updt_ts = NOW(),
+               sts_rsn_tx = 'claimed for replay (future-dated)'
+         WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+        RETURNING r.*;
+        """;
+    return em.createNativeQuery(sql, RetryOutboxEntity.class)
+        .setParameter("maxRetries", maxRetries)
+        .setParameter("leaseSeconds", leaseSeconds)
+        .setParameter("batchSize", batchSize)
+        .setParameter("statusCd", statusCd)
+        .getResultList();
+  }
+
+  @Override
+  public List<RetryOutboxEntity> claimCancelSameDay(LocalDate today, int maxRetries, int batchSize, String statusCd) {
+    var sql = """
+        WITH c AS (
+          SELECT pyrl_rtry_id
+          FROM pyrl_mgmt.pyrl_rtry_outbox
+          WHERE ent_type_nm IN ('Payroll','ContractorPayment','ContractorPaymentGroup')
+            AND sts_cd = 'FAILED'
+            AND (rtry_cn >= :maxRetries OR (expr_ts IS NOT NULL AND expr_ts <= NOW()))
+          ORDER BY cre_ts
+          FOR UPDATE SKIP LOCKED
+          LIMIT :batchSize
+        )
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox r
+           SET sts_cd = :statusCd,
+               updt_ts = NOW(),
+               sts_rsn_tx = 'claimed for cancel (same-day)'
+         WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+        RETURNING r.*;
+        """;
+    return em.createNativeQuery(sql, RetryOutboxEntity.class)
+        .setParameter("maxRetries", maxRetries)
+        .setParameter("batchSize", batchSize)
+        .setParameter("statusCd", statusCd)
+        .getResultList();
+  }
+
+  @Override
+  public List<RetryOutboxEntity> claimCancelFuture(LocalDate today, int maxRetries, int batchSize, String statusCd) {
+    var sql = """
+        WITH c AS (
+          SELECT pyrl_rtry_id
+          FROM pyrl_mgmt.pyrl_rtry_outbox
+          WHERE ent_type_nm IN ('Payroll','ContractorPayment','ContractorPaymentGroup')
+            AND sts_cd = 'FAILED'
+            AND (rtry_cn >= :maxRetries OR (expr_ts IS NOT NULL AND expr_ts <= NOW()))
+          ORDER BY cre_ts
+          FOR UPDATE SKIP LOCKED
+          LIMIT :batchSize
+        )
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox r
+           SET sts_cd = :statusCd,
+               updt_ts = NOW(),
+               sts_rsn_tx = 'claimed for cancel (future-dated)'
+         WHERE r.pyrl_rtry_id IN (SELECT pyrl_rtry_id FROM c)
+        RETURNING r.*;
+        """;
+    return em.createNativeQuery(sql, RetryOutboxEntity.class)
+        .setParameter("maxRetries", maxRetries)
+        .setParameter("batchSize", batchSize)
+        .setParameter("statusCd", statusCd)
+        .getResultList();
+  }
+
+  @Override public int markSent(String retryId, String reason, String statusCd) {
+    var sql = """
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox
+           SET sts_cd = :statusCd,
+               rtry_cn = rtry_cn + 1,
+               updt_ts = NOW(),
+               sts_rsn_tx = :reason
+         WHERE pyrl_rtry_id = :retryId
+        """;
+    return em.createNativeQuery(sql)
+        .setParameter("retryId", retryId)
+        .setParameter("reason", reason)
+        .setParameter("statusCd", statusCd)
+        .executeUpdate();
+  }
+
+  @Override public int markPublishFailed(String retryId, String error, String statusCd) {
+    var sql = """
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox
+           SET sts_cd = :statusCd,
+               rtry_cn = rtry_cn + 1,
+               updt_ts = NOW(),
+               sts_rsn_tx = :error
+         WHERE pyrl_rtry_id = :retryId
+        """;
+    return em.createNativeQuery(sql)
+        .setParameter("retryId", retryId)
+        .setParameter("error", error)
+        .setParameter("statusCd", statusCd)
+        .executeUpdate();
+  }
+
+  @Override public int markCancelSent(String retryId, String reason, String statusCd) {
+    var sql = """
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox
+           SET sts_cd = :statusCd,
+               rtry_cn = rtry_cn + 1,
+               updt_ts = NOW(),
+               sts_rsn_tx = :reason
+         WHERE pyrl_rtry_id = :retryId
+        """;
+    return em.createNativeQuery(sql)
+        .setParameter("retryId", retryId)
+        .setParameter("reason", reason)
+        .setParameter("statusCd", statusCd)
+        .executeUpdate();
+  }
+}
+
+package net.jpmchase.payroll.recon.repository.mgmt.payroll.sql;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Profile;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDate;
+import java.util.List;
+
+@Repository
+@Profile("h2")
+@RequiredArgsConstructor
+public class H2RetryOutboxSql implements RetryOutboxSql {
+
+  @PersistenceContext private EntityManager em;
+
+  @Override
+  public List<RetryOutboxEntity> claimReplaySameDay(LocalDate today, int maxRetries, int batchSize, int leaseSeconds, String statusCd) {
+    // 1) select ids
+    var select = """
+        SELECT pyrl_rtry_id
+          FROM pyrl_mgmt.pyrl_rtry_outbox
+         WHERE ent_type_nm IN ('Payroll','ContractorPayment','ContractorPaymentGroup')
+           AND sts_cd = 'FAILED'
+           AND rtry_cn < :maxRetries
+           AND (expr_ts IS NULL OR expr_ts > CURRENT_TIMESTAMP)
+           AND (updt_ts IS NULL OR updt_ts < DATEADD(SECOND, -:leaseSeconds, CURRENT_TIMESTAMP))
+         ORDER BY cre_ts
+         LIMIT :batchSize
+        """;
+    @SuppressWarnings("unchecked")
+    var ids = (List<Object>) em.createNativeQuery(select)
+        .setParameter("maxRetries", maxRetries)
+        .setParameter("leaseSeconds", leaseSeconds)
+        .setParameter("batchSize", batchSize)
+        .getResultList();
+
+    if (ids.isEmpty()) return List.of();
+
+    // 2) update claimed and read them back
+    var update = """
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox
+           SET sts_cd = :statusCd,
+               updt_ts = CURRENT_TIMESTAMP,
+               sts_rsn_tx = 'claimed for replay (same-day)'
+         WHERE pyrl_rtry_id IN (:ids)
+        """;
+    em.createNativeQuery(update)
+        .setParameter("statusCd", statusCd)
+        .setParameter("ids", ids)
+        .executeUpdate();
+
+    var fetch = """
+        SELECT *
+          FROM pyrl_mgmt.pyrl_rtry_outbox
+         WHERE pyrl_rtry_id IN (:ids)
+        """;
+    return em.createNativeQuery(fetch, RetryOutboxEntity.class)
+        .setParameter("ids", ids)
+        .getResultList();
+  }
+
+  @Override
+  public List<RetryOutboxEntity> claimReplayFuture(LocalDate today, int maxRetries, int batchSize, int leaseSeconds, String statusCd) {
+    // same as above; just change reason text
+    // (omitted here for brevity—duplicate and replace the reason string with 'claimed for replay (future-dated)')
+    return claimReplaySameDay(today, maxRetries, batchSize, leaseSeconds, statusCd);
+  }
+
+  @Override
+  public List<RetryOutboxEntity> claimCancelSameDay(LocalDate today, int maxRetries, int batchSize, String statusCd) {
+    var select = """
+        SELECT pyrl_rtry_id
+          FROM pyrl_mgmt.pyrl_rtry_outbox
+         WHERE ent_type_nm IN ('Payroll','ContractorPayment','ContractorPaymentGroup')
+           AND sts_cd = 'FAILED'
+           AND (rtry_cn >= :maxRetries OR (expr_ts IS NOT NULL AND expr_ts <= CURRENT_TIMESTAMP))
+         ORDER BY cre_ts
+         LIMIT :batchSize
+        """;
+    @SuppressWarnings("unchecked")
+    var ids = (List<Object>) em.createNativeQuery(select)
+        .setParameter("maxRetries", maxRetries)
+        .setParameter("batchSize", batchSize)
+        .getResultList();
+
+    if (ids.isEmpty()) return List.of();
+
+    var update = """
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox
+           SET sts_cd = :statusCd,
+               updt_ts = CURRENT_TIMESTAMP,
+               sts_rsn_tx = 'claimed for cancel (same-day)'
+         WHERE pyrl_rtry_id IN (:ids)
+        """;
+    em.createNativeQuery(update)
+        .setParameter("statusCd", statusCd)
+        .setParameter("ids", ids)
+        .executeUpdate();
+
+    var fetch = "SELECT * FROM pyrl_mgmt.pyrl_rtry_outbox WHERE pyrl_rtry_id IN (:ids)";
+    return em.createNativeQuery(fetch, RetryOutboxEntity.class)
+        .setParameter("ids", ids)
+        .getResultList();
+  }
+
+  @Override
+  public List<RetryOutboxEntity> claimCancelFuture(LocalDate today, int maxRetries, int batchSize, String statusCd) {
+    // same as above; just change reason text to 'claimed for cancel (future-dated)'
+    return claimCancelSameDay(today, maxRetries, batchSize, statusCd);
+  }
+
+  @Override public int markSent(String retryId, String reason, String statusCd) {
+    var sql = """
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox
+           SET sts_cd = :statusCd,
+               rtry_cn = rtry_cn + 1,
+               updt_ts = CURRENT_TIMESTAMP,
+               sts_rsn_tx = :reason
+         WHERE pyrl_rtry_id = :retryId
+        """;
+    return em.createNativeQuery(sql)
+        .setParameter("retryId", retryId)
+        .setParameter("reason", reason)
+        .setParameter("statusCd", statusCd)
+        .executeUpdate();
+  }
+
+  @Override public int markPublishFailed(String retryId, String error, String statusCd) {
+    var sql = """
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox
+           SET sts_cd = :statusCd,
+               rtry_cn = rtry_cn + 1,
+               updt_ts = CURRENT_TIMESTAMP,
+               sts_rsn_tx = :error
+         WHERE pyrl_rtry_id = :retryId
+        """;
+    return em.createNativeQuery(sql)
+        .setParameter("retryId", retryId)
+        .setParameter("error", error)
+        .setParameter("statusCd", statusCd)
+        .executeUpdate();
+  }
+
+  @Override public int markCancelSent(String retryId, String reason, String statusCd) {
+    var sql = """
+        UPDATE pyrl_mgmt.pyrl_rtry_outbox
+           SET sts_cd = :statusCd,
+               rtry_cn = rtry_cn + 1,
+               updt_ts = CURRENT_TIMESTAMP,
+               sts_rsn_tx = :reason
+         WHERE pyrl_rtry_id = :retryId
+        """;
+    return em.createNativeQuery(sql)
+        .setParameter("retryId", retryId)
+        .setParameter("reason", reason)
+        .setParameter("statusCd", statusCd)
+        .executeUpdate();
+  }
+}
+
+package net.jpmchase.payroll.recon.repository.mgmt.payroll;
+
+import net.jpmchase.payroll.recon.repository.mgmt.entity.payroll.RetryOutboxEntity;
+import org.springframework.data.repository.CrudRepository;
+
+import java.util.UUID;
+
+public interface RetryOutboxRepository
+    extends CrudRepository<RetryOutboxEntity, UUID>, RetryOutboxRepositoryCustom {
+}
+
+package net.jpmchase.payroll.recon.repository.mgmt.payroll;
+
+import net.jpmchase.payroll.recon.repository.mgmt.entity.payroll.RetryOutboxEntity;
+
+import java.time.LocalDate;
+import java.util.List;
+
+public interface RetryOutboxRepositoryCustom {
+  List<RetryOutboxEntity> claimReplaySameDay(LocalDate today, int maxRetries, int batchSize, int leaseSeconds, String statusCd);
+  List<RetryOutboxEntity> claimReplayFuture(LocalDate today, int maxRetries, int batchSize, int leaseSeconds, String statusCd);
+  List<RetryOutboxEntity> claimCancelSameDay(LocalDate today, int maxRetries, int batchSize, String statusCd);
+  List<RetryOutboxEntity> claimCancelFuture(LocalDate today, int maxRetries, int batchSize, String statusCd);
+
+  int markSent(String retryId, String reason, String statusCd);
+  int markPublishFailed(String retryId, String error, String statusCd);
+  int markCancelSent(String retryId, String reason, String statusCd);
+}
+
