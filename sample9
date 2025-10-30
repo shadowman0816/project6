@@ -1,0 +1,284 @@
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-bom</artifactId>
+      <version>1.20.1</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+
+<dependencies>
+  <!-- Boot autoconfig for Testcontainers -->
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-testcontainers</artifactId>
+    <scope>test</scope>
+  </dependency>
+
+  <dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <scope>test</scope>
+  </dependency>
+
+  <dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+  </dependency>
+
+  <dependency>
+    <groupId>org.postgresql</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+  </dependency>
+</dependencies>
+
+<build>
+  <plugins>
+    <!-- JUnit 5 -->
+    <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-surefire-plugin</artifactId>
+      <version>3.2.5</version>
+    </plugin>
+  </plugins>
+</build>
+
+CREATE SCHEMA IF NOT EXISTS pyr_mgmt;
+CREATE SCHEMA IF NOT EXISTS pyr_schd;
+-- add other schemas your entities reference
+
+package net.jpmchase.payroll.testcontainers;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.TestInstance;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+import java.nio.file.Files;
+import java.nio.file.Paths;
+
+@Testcontainers
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+public abstract class PostgresTcSupport {
+
+  // Reusable container for the whole test JVM
+  protected static final PostgreSQLContainer<?> PG =
+      new PostgreSQLContainer<>(DockerImageName.parse("postgres:15.6"));
+
+  @BeforeAll
+  void start() throws Exception {
+    PG.start();
+    // Run schema init script
+    var sql = Files.readString(Paths.get("src/test/resources/sql/init_schemas.sql"));
+    try (var conn = PG.createConnection("");
+         var st = conn.createStatement()) {
+      st.execute(sql);
+    }
+  }
+
+  @AfterAll
+  void stop() {
+    PG.stop();
+  }
+
+  @DynamicPropertySource
+  static void registerPg(DynamicPropertyRegistry r) {
+    r.add("spring.datasource.url", PG::getJdbcUrl);
+    r.add("spring.datasource.username", PG::getUsername);
+    r.add("spring.datasource.password", PG::getPassword);
+
+    // Hibernate & JPA
+    r.add("spring.jpa.hibernate.ddl-auto", () -> "create-drop"); // let JPA create tables
+    r.add("spring.jpa.show-sql", () -> "false");
+    r.add("spring.jpa.properties.hibernate.default_schema", () -> "pyr_mgmt");
+
+    // Make sure Hibernate uses the proper dialect
+    r.add("spring.jpa.database-platform",
+          () -> "org.hibernate.dialect.PostgreSQLDialect");
+  }
+}
+package net.jpmchase.payroll.recon.repository.mgmt.payroll;
+
+import net.jpmchase.payroll.recon.repository.mgmt.entity.payroll.RetryOutboxEntity;
+import net.jpmchase.payroll.testcontainers.PostgresTcSupport;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
+import org.springframework.test.annotation.Rollback;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.UUID;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Transactional
+class RetryOutboxRepositoryTest extends PostgresTcSupport {
+
+  @Autowired
+  private RetryOutboxRepository repository;
+
+  private RetryOutboxEntity createEntity(String entType, String status, int retryCount,
+                                         LocalDateTime exprTs, LocalDateTime updtTs,
+                                         String statusCd) {
+    RetryOutboxEntity e = new RetryOutboxEntity();
+    e.setPyrlRtryId(UUID.randomUUID().toString());
+    e.setEntityType(entType);
+    e.setStatus(status);
+    e.setRetryCount(retryCount);
+    e.setExpiryTs(exprTs != null ? Timestamp.valueOf(exprTs) : null);
+    e.setUpdtTs(updtTs != null ? Timestamp.valueOf(updtTs) : null);
+    e.setStatusCd(statusCd);
+    e.setJourneyName("journey");
+    e.setSrcEvtId("evt");
+    e.setSrcCompanyId("company");
+    e.setEntId("ent");
+    e.setStepName("step");
+    e.setRetryTypeName("FAILURE");
+    e.setCreUsrId("user");
+    // set other required fields as per your entity mapping
+    return e;
+  }
+
+  @BeforeEach
+  void setup() {
+    repository.deleteAll();
+  }
+
+  @Test
+  @DisplayName("claimReplaySameDay returns and updates correct entities")
+  void testClaimReplaySameDay() {
+    LocalDate today = LocalDate.now();
+    var entity = createEntity("Payroll", "FAILED", 0, LocalDateTime.now(), null, null);
+    repository.save(entity);
+
+    List<RetryOutboxEntity> claimed =
+        repository.claimReplaySameDay(today, 3, 10, 60, "IN_PROGRESS");
+
+    assertFalse(claimed.isEmpty());
+    assertEquals("IN_PROGRESS", claimed.get(0).getStatus());
+    assertEquals("claimed for replay (same-day)", claimed.get(0).getStatusReason());
+  }
+
+  @Test
+  @DisplayName("claimReplaySameDay returns empty if no match")
+  void testClaimReplaySameDay_noMatch() {
+    LocalDate today = LocalDate.now();
+    List<RetryOutboxEntity> claimed =
+        repository.claimReplaySameDay(today, 1, 10, 60, "IN_PROGRESS");
+    assertTrue(claimed.isEmpty());
+  }
+
+  @Test
+  @DisplayName("claimReplayFuture returns and updates correct entities")
+  void testClaimReplayFuture() {
+    LocalDate today = LocalDate.now();
+    var entity = createEntity("Payroll", "FAILED", 0, LocalDateTime.now().plusDays(1), null, null);
+    repository.save(entity);
+
+    List<RetryOutboxEntity> claimed =
+        repository.claimReplayFuture(today, 3, 10, 60, "IN_PROGRESS");
+
+    assertFalse(claimed.isEmpty());
+    assertEquals("IN_PROGRESS", claimed.get(0).getStatus());
+    assertEquals("claimed for replay (future-dated)", claimed.get(0).getStatusReason());
+  }
+
+  @Test
+  @DisplayName("claimCancelSameDay returns and updates")
+  void testClaimCancelSameDay() {
+    LocalDate today = LocalDate.now();
+    var entity = createEntity("Payroll", "FAILED", 3, LocalDateTime.now(), null, null);
+    repository.save(entity);
+
+    var claimed = repository.claimCancelSameDay(today, 3, 10, "CANCELLED");
+    assertFalse(claimed.isEmpty());
+    assertEquals("CANCELLED", claimed.get(0).getStatus());
+    assertEquals("claimed for cancel (same-day)", claimed.get(0).getStatusReason());
+  }
+
+  @Test
+  @DisplayName("claimCancelFuture returns and updates")
+  void testClaimCancelFuture() {
+    LocalDate today = LocalDate.now();
+    var entity = createEntity("Payroll", "FAILED", 3, LocalDateTime.now().plusDays(1), null, null);
+    repository.save(entity);
+
+    var claimed = repository.claimCancelFuture(today, 3, 10, "CANCELLED");
+    assertFalse(claimed.isEmpty());
+    assertEquals("CANCELLED", claimed.get(0).getStatus());
+    assertEquals("claimed for cancel (future-dated)", claimed.get(0).getStatusReason());
+  }
+
+  @Test
+  @DisplayName("markSent updates status and increments retryCount")
+  @Rollback
+  void testMarkSent() {
+    var entity = createEntity("Payroll", "FAILED", 1, LocalDateTime.now(), null, null);
+    repository.save(entity);
+
+    int updated = repository.markSent(entity.getPyrlRtryId(), "Sent for replay", "SENT");
+    assertEquals(1, updated);
+
+    RetryOutboxEntity reloaded = repository.findById(entity.getPyrlRtryId()).orElseThrow();
+    assertEquals("SENT", reloaded.getStatus());
+    assertEquals(2, reloaded.getRetryCount());
+    assertEquals("Sent for replay", reloaded.getStatusReason());
+  }
+
+  @Test
+  @DisplayName("markPublishFailed updates status and increments retryCount")
+  void testMarkPublishFailed() {
+    var entity = createEntity("Payroll", "FAILED", 1, LocalDateTime.now(), null, null);
+    repository.save(entity);
+
+    int updated = repository.markPublishFailed(entity.getPyrlRtryId(), "Publish failed", "FAILED");
+    assertEquals(1, updated);
+
+    RetryOutboxEntity reloaded = repository.findById(entity.getPyrlRtryId()).orElseThrow();
+    assertEquals("FAILED", reloaded.getStatus());
+    assertEquals(2, reloaded.getRetryCount());
+    assertEquals("Publish failed", reloaded.getStatusReason());
+  }
+
+  @Test
+  @DisplayName("markCancelSent updates status and increments retryCount")
+  void testMarkCancelSent() {
+    var entity = createEntity("Payroll", "FAILED", 1, LocalDateTime.now(), null, null);
+    repository.save(entity);
+
+    int updated = repository.markCancelSent(entity.getPyrlRtryId(), "Cancel sent", "CANCELLED");
+    assertEquals(1, updated);
+
+    RetryOutboxEntity reloaded = repository.findById(entity.getPyrlRtryId()).orElseThrow();
+    assertEquals("CANCELLED", reloaded.getStatus());
+    assertEquals(2, reloaded.getRetryCount());
+    assertEquals("Cancel sent", reloaded.getStatusReason());
+  }
+
+  @Test
+  @DisplayName("mark* methods return 0 for missing id")
+  void testMarkMethods_notFound() {
+    String id = UUID.randomUUID().toString();
+    assertEquals(0, repository.markSent(id, "reason", "SENT"));
+    assertEquals(0, repository.markPublishFailed(id, "error", "FAILED"));
+    assertEquals(0, repository.markCancelSent(id, "reason", "CANCELLED"));
+  }
+}
