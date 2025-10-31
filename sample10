@@ -1,4 +1,4 @@
-package net.jpmchase.payroll.recon.repository.mgmt.payroll.sql;
+ package net.jpmchase.payroll.recon.repository.mgmt.payroll.sql;
 
 import net.jpmchase.payroll.recon.repository.mgmt.entity.payroll.RetryOutboxEntity;
 
@@ -392,4 +392,22 @@ public interface RetryOutboxRepositoryCustom {
   int markPublishFailed(String retryId, String error, String statusCd);
   int markCancelSent(String retryId, String reason, String statusCd);
 }
+Designed and delivered the core Payroll Event Processing Framework, enabling seamless automation of payroll lifecycle events (processed, cancelled, reversed, validated).
+	•	Engineered key modules across Processor, Billing API, and Notification Services, improving system reliability and audit compliance.
+	•	Implemented AWS SQS-based intra/cross-account orchestration, Avro schema governance, and reusable testing frameworks—strengthening platform scalability and resilience.
+	•	Delivered end-to-end SAF, ACH, and SafePay reversal logic, reducing manual intervention and improving recovery time for failed events.
+	•	Supported Billing API enhancements (company-level and payee-level) that improved financial reconciliation and downstream accuracy.
+
+Partnered with Gusto, PIM, CIB, and KSaaS teams to ensure reliable and timely data synchronization across payroll systems.
+	•	Anticipated and resolved potential client-impacting issues in webhook validation, notification delivery, and billing data accuracy.
+	•	Actively contributed to analysis and design of next-gen capabilities such as same-day and future-dated payroll processing.
+	•	Maintained consistent communication with stakeholders, ensuring on-time delivery and high confidence in every release cycle.
+
+Acted as a senior technical anchor, mentoring peers and leading design/peer reviews for cross-module integrations.
+	•	Championed test coverage improvement through reusable SAF component and contract test frameworks.
+	•	Strengthened team collaboration by building clarity around event orchestration, exception handling, and infrastructure deployment.
+	•	Owned production readiness tasks like Splunk/Dynatrace observability and DB schema reliability, improving system transparency.
+	•	Consistently served as the go-to engineer for critical design and troubleshooting sessions across squads.
+
+Demonstrated end-to-end ownership across architecture, development, and cross-system integration. Drove multiple first-time technical initiatives in AWS and event-driven payroll processing while mentoring peers and ensuring business continuity. Looking forward to expanding into broader architectural leadership and scaling our platform’s innovation and resilience.
 
