@@ -410,4 +410,9 @@ Acted as a senior technical anchor, mentoring peers and leading design/peer revi
 	•	Consistently served as the go-to engineer for critical design and troubleshooting sessions across squads.
 
 Demonstrated end-to-end ownership across architecture, development, and cross-system integration. Drove multiple first-time technical initiatives in AWS and event-driven payroll processing while mentoring peers and ensuring business continuity. Looking forward to expanding into broader architectural leadership and scaling our platform’s innovation and resilience.
-
+@SpringBootApplication(exclude = {
+  org.springframework.boot.autoconfigure.web.reactive.WebFluxAutoConfiguration.class,
+  org.springframework.boot.autoconfigure.security.reactive.ReactiveSecurityAutoConfiguration.class,
+  org.springframework.boot.autoconfigure.web.reactive.ReactiveWebServerFactoryAutoConfiguration.class
+})
+public class Application { }
