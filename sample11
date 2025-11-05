@@ -59,3 +59,83 @@ public class ServletSecurityConfig {
   }
 }
 This happens because after enabling KSaaS your app starts an application context that is not a Servlet web app (KSaaS starters often bootstrap a non-web/worker context). Your ADFSSecurityConfig always creates a SecurityFilterChain, which requires a ServletContext. In that non-web context there is none, so it blows up.
+@Configuration(proxyBeanMethods = false)
+@ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
+@EnableMethodSecurity
+@EnableAdfs
+@Slf4j
+public class ADFSSecurityConfig {
+
+    private final Environment environment;
+    private final AdfsConfigurer<HttpSecurity> adfsConfigurer;
+
+    public ADFSSecurityConfig(Environment environment,
+                              @Autowired(required = false) AdfsConfigurer<HttpSecurity> adfsConfigurer) {
+        this.environment = environment;
+        this.adfsConfigurer = adfsConfigurer;
+    }
+
+    // ⬇️ Inject ServletContext so Spring defers bean creation until the web server is up
+    @Bean
+    SecurityFilterChain filterChain(HttpSecurity http, ServletContext servletContext) throws Exception {
+
+        if (!isRunningLocally()) {
+            http.requiresChannel(c -> c.anyRequest().requiresSecure());
+        } else {
+            http.csrf(csrf -> csrf.disable());
+        }
+
+        if (adfsConfigurer != null) {
+            http.apply(adfsConfigurer);
+        }
+
+        http.headers(h -> h.contentSecurityPolicy(p -> p.policyDirectives("script-src 'self'")));
+
+        // ⬇️ Use only literal patterns; NO EndpointRequest.*
+        http.authorizeHttpRequests(req -> req
+            .requestMatchers(swaggerPaths()).permitAll()
+            .requestMatchers(tokenPaths()).permitAll()
+            .requestMatchers(actuatorPaths()).permitAll()
+            .requestMatchers(HttpMethod.GET,    "/**").hasAuthority(AppConstants.RESOURCE_READ_ROLE)
+            .requestMatchers(HttpMethod.POST,   "/**").hasAuthority(AppConstants.RESOURCE_WRITE_ROLE)
+            .requestMatchers(HttpMethod.PUT,    "/**").hasAuthority(AppConstants.RESOURCE_WRITE_ROLE)
+            .requestMatchers(HttpMethod.DELETE, "/**").hasAuthority(AppConstants.RESOURCE_WRITE_ROLE)
+            .anyRequest().authenticated()
+        );
+
+        return http.build();
+    }
+
+    // Optional: keep a customizer, but make it servlet-safe too
+    @Bean
+    WebSecurityCustomizer webSecurityCustomizer(ServletContext servletContext) {
+        return web -> web.ignoring()
+            .requestMatchers(actuatorPaths()); // if you prefer ignoring over permitAll for actuator
+    }
+
+    private boolean isRunningLocally() {
+        return environment.acceptsProfiles(Profiles.of("local", "dev", "local-h2-enabled", "contract-tests"));
+    }
+
+    // --- literal matchers built from your UNPROTECTED_RESOURCE_URIS ---
+    private static String[] actuatorPaths() {
+        // Your list: keepalive, info, health, metrics, ping, wheelcheck, prometheus, actuator
+        return AppConstants.UNPROTECTED_RESOURCE_URIS.stream()
+            .flatMap(name -> {
+                if ("actuator".equals(name)) {
+                    return Stream.of("/actuator", "/actuator/**");
+                }
+                // map each to /actuator/<name> and /actuator/<name>/**
+                return Stream.of("/actuator/" + name, "/actuator/" + name + "/**");
+            })
+            .toArray(String[]::new);
+    }
+
+    private static String[] swaggerPaths() {
+        return new String[]{ "/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs/**" };
+    }
+
+    private static String[] tokenPaths() {
+        return new String[]{ "/token/**", "/token/*", "/token/{clientId}" };
+    }
+}
