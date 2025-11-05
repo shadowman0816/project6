@@ -1,0 +1,60 @@
+// 2) Fallback for non-web contexts (Kafka worker, etc.)
+@Configuration(proxyBeanMethods = false)
+@ConditionalOnMissingBean(SecurityFilterChain.class)
+public class NoWebSecurityConfig {
+  // Nothing to secure; just prevent Spring Security from trying to create a servlet chain.
+  @Bean
+  WebSecurityCustomizer noopCustomizer() {
+    return web -> {};
+  }
+}
+
+// 1) Servlet security (only created when a Servlet web app is present)
+@Configuration(proxyBeanMethods = false)
+@ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
+@EnableMethodSecurity
+public class ServletSecurityConfig {
+
+  private final Environment env;
+  private final AdfsConfigurer<HttpSecurity> adfsConfigurer; // keep it optional if needed
+
+  public ServletSecurityConfig(Environment env,
+      @Autowired(required = false) AdfsConfigurer<HttpSecurity> adfsConfigurer) {
+    this.env = env;
+    this.adfsConfigurer = adfsConfigurer;
+  }
+
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    // if you keep requiresChannel(), this will only run when ServletContext exists
+    if (!env.acceptsProfiles(Profiles.of("local","dev","local-h2-enabled","contract-test"))) {
+      http.requiresChannel(c -> c.anyRequest().requiresSecure());
+    }
+
+    // do NOT use EndpointRequest unless you are sure actuator servlet endpoints are present
+    http
+      .csrf(AbstractHttpConfigurer::disable)
+      .headers(h -> h.contentSecurityPolicy(csp -> csp.policyDirectives("script-src 'self'")))
+      .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+
+    if (adfsConfigurer != null) {
+      http.with(adfsConfigurer, Customizer.withDefaults())
+          .authorizeHttpRequests(req -> req
+              .requestMatchers("/v3/api-docs/**","/swagger-ui/**","/swagger-ui.html",
+                               "/token/{clientId}").permitAll()
+              .requestMatchers(HttpMethod.GET).hasAuthority(AppConstants.RESOURCE_READ_ROLE)
+              .requestMatchers(HttpMethod.POST, HttpMethod.PUT, HttpMethod.DELETE)
+                  .hasAuthority(AppConstants.RESOURCE_WRITE_ROLE)
+              .anyRequest().authenticated());
+    } else {
+      http.authorizeHttpRequests(req -> req.anyRequest().permitAll());
+    }
+    return http.build();
+  }
+
+  // Optional: only in servlet env
+  @Bean
+  WebSecurityCustomizer webSecurityCustomizer() {
+    return (web) -> web.ignoring().requestMatchers("/actuator/health", "/actuator/info");
+  }
+}
