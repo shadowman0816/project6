@@ -58,3 +58,4 @@ public class ServletSecurityConfig {
     return (web) -> web.ignoring().requestMatchers("/actuator/health", "/actuator/info");
   }
 }
+This happens because after enabling KSaaS your app starts an application context that is not a Servlet web app (KSaaS starters often bootstrap a non-web/worker context). Your ADFSSecurityConfig always creates a SecurityFilterChain, which requires a ServletContext. In that non-web context there is none, so it blows up.
