@@ -1,0 +1,254 @@
+Absolutely—here’s a concrete, “ready-to-document” test plan you can lift into your QA doc or Jira test cases. I organized it around your runtime knobs (date windows, cutoff/expiry, retry counts), the three replay policies (StartFromBeginning, StartWithSkips, RetryFromFailed), and your events/entities (payroll.processed, contractor.created, contractor.group.created). Wherever it matters, I call out the expected processor behavior (status, next action, SAF scheduling, cancel flags, etc.).
+
+⸻
+
+Assumptions / knobs (align to your DEV config)
+	•	Cutoff windows in YAML (example):
+	•	safConfigs.maxBackoffHours = 3
+	•	safConfigs.cutoffTime = 18:30
+	•	Retry config precedence: step > group > workflow (your finalized rule).
+	•	Exception taxonomy (your service): FATAL, BUSINESS_VALIDATION, INFRA_RETRYABLE, SKIPPABLE, FLOW_HALT, SILENT_WARNING.
+	•	Steps honor executeOnCondition (string name resolves to a bean).
+	•	Event types/entities exercised here:
+	•	Journey: Payroll
+	•	Entities: payroll, contractor, contractorGroup
+	•	Event names: payroll.processed, contractor.created, contractor.group.created
+	•	Outbox table fields used: id, journey_name, entity_name, event_name, retry_count, max_retries, expiry_ts, payload, last_error, status (adapt names to your schema).
+	•	Publisher pushes to processor topic; processor logs step outcomes and final context (e.g., CANCEL_GUSTO_PAYROLL when BUSINESS_VALIDATION).
+
+⸻
+
+Test Data Setup (minimal fixtures)
+	•	Create three journeys in YAML: Payroll (as in your screenshots), ContractorPaymentGroup, and a basic Contractor journey.
+	•	Seed 3–5 representative events per entity with controllable payload flags to trigger each exception type.
+	•	Parameterize expiry_ts, retry_count, max_retries, and a policy column or header that drives:
+	1.	StartFromBeginning
+	2.	StartWithSkips (conditions cause skips)
+	3.	RetryFromFailed (resume from first failed step)
+
+⸻
+
+A. Retry-Outbox Scanning & Selection
+
+A1. Select only non-expired rows
+	•	Given: 3 rows for payroll.processed with expiry_ts in the future; 2 rows already expired
+	•	When: recon manager scan runs
+	•	Then: only non-expired rows are read and published; expired remain untouched (status/log show “expired – not enqueued”).
+
+A2. Borderline expiry (== now)
+	•	Row with expiry_ts exactly equal to the scan instant.
+	•	Expectation: treat as expired (document this rule), do not publish.
+
+A3. Below retry limit
+	•	retry_count < max_retries → eligible → publish.
+
+A4. At retry limit
+	•	retry_count == max_retries → do not publish; mark as “max retries reached”.
+
+A5. Missing max_retries (null)
+	•	Use workflow default; publish if under default.
+
+A6. Mixed journey filter
+	•	Rows for payroll, contractor, contractorGroup in same table.
+	•	Ensure all journeys/entities are picked up according to configured selectors.
+
+A7. Idempotency on rescan
+	•	Same outbox row appears on two overlapping scans.
+	•	Ensure second scan ignores it after first marks in-flight (e.g., by status or leased flag).
+
+⸻
+
+B. Cutoff & Holiday Logic (time windows)
+
+B1. Same-day BEFORE cutoff (e.g., today 16:00 < 18:30)
+	•	payroll.processed events should be processed now.
+	•	No SAF deferral due to time window.
+
+B2. Same-day AFTER cutoff
+	•	With SAF enabled and within maxBackoffHours, event should be deferred (SAF scheduled).
+	•	Processor logs “Skipping step due to SAF condition.”
+
+B3. Future-date payroll (calculated date tomorrow)
+	•	If journey rules say “process on same day only,” expect SAF defer until window; otherwise process (define the expected rule for your team).
+
+B4. Holiday (bank holiday flag true)
+	•	Same-day events with holiday flag → SAF defer to next business window.
+	•	Verify next run moves them into execution.
+
+B5. Holiday + MaxBackoff exceeded
+	•	If deferral would exceed maxBackoffHours, execute immediately (or mark as violation)—document your chosen behavior and assert it.
+
+⸻
+
+C. Publisher Behavior (to Processor)
+
+C1. Happy path publish
+	•	All eligible rows → one message per row; headers include journey/entity/event IDs and policy.
+	•	Verify count and payload integrity.
+
+C2. Broker temporary failure
+	•	Simulate transient Kafka error → retry publish (publisher retry policy) and backoff.
+	•	Row stays eligible until ack; eventually published.
+
+C3. Broker hard failure
+	•	Exhaust publisher retries → mark outbox row with last_error & increment retry_count.
+	•	Row remains for future scans (if under max retries).
+
+C4. Duplicate publish protection
+	•	Publish same outbox row twice (network retry with unknown ack).
+	•	Processor dedupes using event id/idempotency key; only one journey run.
+
+⸻
+
+D. Processor Entry & 3 Replay Policies
+
+For each event (payroll.processed, contractor.created, contractor.group.created) run these 3:
+
+D1. StartFromBeginning
+	•	Processor runs steps in order; final status COMPLETED.
+	•	Verify all step audits written once.
+
+D2. StartWithSkips
+	•	Provide conditions for 2 middle steps to evaluate false.
+	•	Expect “Skipping step ‘X’ due to failed condition” logs; overall COMPLETED.
+
+D3. RetryFromFailed
+	•	Pre-mark prior failed step in audit (or craft payload to throw on step N first attempt).
+	•	Policy resumes at step N; steps < N are NOT re-executed.
+	•	Final status COMPLETED.
+
+⸻
+
+E. Condition Evaluation Edge Cases
+
+E1. Missing condition bean
+	•	executeOnCondition: FooBarMissingCondition → processor logs error and skips step (as your code), status stays SUCCESS if rest ok.
+
+E2. Condition throws exception
+	•	Catch & log, do not execute step, continue based on your implementation (you log and return false → skip).
+
+E3. Always condition
+	•	always or null → step executes.
+
+⸻
+
+F. Exception Handling (per step)
+
+Create payload knobs to force each type in a designated step; verify handling:
+
+F1. BUSINESS_VALIDATION
+	•	Expect:
+	•	context flag CANCEL_GUSTO_PAYROLL = true
+	•	journey status SUCCESS (you mark success and schedule cancel step depending on flow)
+	•	No retries for that step (per your handleBusinessValidationException).
+
+F2. INFRA_RETRYABLE
+	•	With step-level retry config present → retry until max; after max, SAF schedule if enabled, otherwise set FAILED.
+
+F3. FATAL
+	•	Immediate FAILED; journey ends; outbox row may be marked terminal.
+
+F4. SKIPPABLE
+	•	Log warning; mark step success; continue; journey COMPLETED.
+
+F5. FLOW_HALT
+	•	Journey status COMPLETED (by your code), no further steps run.
+
+F6. SILENT_WARNING
+	•	Log minimal; continue; journey COMPLETED.
+
+⸻
+
+G. Retry/Backoff Precedence & Counters
+
+G1. Step vs Group vs Workflow precedence
+	•	Provide conflicting maxRetryCount at all three levels.
+	•	Verify step-level wins, then group, then workflow.
+
+G2. Immediate retry vs SAF backoff
+	•	Immediate retries (tight loop within call) occur up to maxRetryCount.
+	•	After exhaustion and if safEnabled=true, create backoff entry with next attempt ≤ maxBackoffHours.
+
+G3. Cutoff & backoff interplay
+	•	Next backoff time would cross cutoff → defer to next allowed window; assert scheduled timestamp.
+
+G4. Retry counters persist
+	•	After each failed attempt, retry_count increments in audit/outbox; after success it resets/archives row.
+
+⸻
+
+H. Same-Day vs Future-Date Business Rules
+
+H1. Same-day payroll
+	•	Ensure steps like GeneratePIMIdentifier, PersistPayrollHierarchyToDatabase, SendRequestToPIM, GustoDisbursementReconciliationForPayroll all execute when conditions true.
+
+H2. Future-date payroll
+	•	If your rule is “prepare but do not send to PIM,” assert upstream steps run, SendRequestToPIM is skipped via condition.
+
+H3. Date mismatch guard (from earlier requirement)
+	•	If calculated date in entity ≠ provider response → throw BUSINESS_VALIDATION; verify cancel flag and no PIM send.
+
+⸻
+
+I. Journey Variants (Contractor flows)
+
+I1. contractor.created
+	•	Minimal path; ensure the same 3 policies behave identically (start, skip, retry-from-fail).
+	•	Verify entity-specific audits saved.
+
+I2. contractor.group.created
+	•	Group step fails with INFRA_RETRYABLE once; confirm retry then success.
+
+⸻
+
+J. Kafka Producer & Idempotency
+
+J1. Partition & keying
+	•	Verify key = companyId (or whatever you use); same company events land in same partition (order preserved).
+
+J2. Idempotent send
+	•	Enable idempotence; send duplicates; only one processing.
+
+J3. Header integrity
+	•	Required headers (journey/entity/event/policy, correlationId, idempotencyKey) present in processor.
+
+⸻
+
+K. Persistence & Audit
+
+K1. Step audit on success
+	•	One audit row per executed step; skipped steps recorded as SKIPPED (if you persist that), otherwise no row.
+
+K2. Step audit on failure
+	•	Record error type/message, attempt number, next action (retry/SAF/stop).
+
+K3. Final journey status
+	•	After completion (even with skips) status COMPLETED; after FATAL FAILED; after BUSINESS_VALIDATION SUCCESS + cancel flag.
+
+⸻
+
+L. Security / ADFS provider present for Kafka-SaaS
+
+L1. Provider beans bound
+	•	At ApplicationReady, assert non-null:
+	•	moneta.security.adfs.provider.url
+	•	client ksaas-c2c-ida-token-provider exists
+	•	Kafka cluster oauth2.provider-id resolves.
+	•	If missing → processor should never start (fail fast).
+
+⸻
+
+M. Operational / Observability
+
+M1. MDC wiring
+	•	GUSTO_EVENTID, COMPANY_UUID, STEP_NAME present for all logs in processor.
+
+M2. Dead-letter on terminal failure
+	•	If you have DLQ: terminal events routed; assert DLQ message content.
+
+M3. Health & metrics
+	•	Liveness/Readiness green after start; custom counters for retries, saf deferrals, skips are incremented.
+
+⸻
+
+Minimal SQL/Fixture examples (adapt names)
