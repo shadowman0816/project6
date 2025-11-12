@@ -252,3 +252,29 @@ M3. Health & metrics
 ⸻
 
 Minimal SQL/Fixture examples (adapt names)
+
+
+import org.apache.avro.generic.GenericRecord;
+
+@KafkaListener(topics = "...", groupId = "...")
+public void onMessage(ConsumerRecord<String, GenericRecord> record) {
+    GenericRecord gr = record.value();
+    Event e = mapGeneric(gr, record);
+    eventProcessorService.processEvent(e);
+}
+
+private Event mapGeneric(GenericRecord gr, ConsumerRecord<String, ?> rec) {
+    // field names must match your .avsc
+    var body = new MessageBody();
+    body.setEventIdUUID(String.valueOf(gr.get("eventIdentifier")));
+    body.setEventProcessTimestamp((Long) gr.get("eventProcessTimestamp"));
+    body.setEventTypeName((String) gr.get("eventTypeName"));
+    body.setEntityTypeName((String) gr.get("entityTypeName"));
+    body.setEntityIdentifier((String) gr.get("entityIdentifier"));
+    body.setResourceTypeName((String) gr.get("resourceTypeName"));
+    body.setResourceIdentifier((String) gr.get("resourceIdentifier"));
+    // ...
+    var e = new Event();
+    e.setMessageBody(body);
+    return e;
+}
