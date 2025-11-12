@@ -291,3 +291,10 @@ private Event mapGeneric(GenericRecord gr, ConsumerRecord<String, ?> rec) {
 public void onMessage(ConsumerRecord<String, org.apache.avro.generic.GenericRecord> rec) {
   // same as above
 }
+Yeah, I saw that error — looks like the deserializer class isn’t on the runtime classpath. It’s not a big deal though, this one’s happening because in our setup the internal topic producer is using our own connection factory (not Photon’s), so it’s sending the payload as raw bytes.
+
+Since SBP doesn’t explicitly specify any DC relay serializer setup, the processor here isn’t picking up the Confluent Avro deserializer — hence the class not found. So, it’s not about anyone’s change; it’s just how this particular service wiring works.
+
+I’m planning to handle it by either consuming the payload as a byte array (and decoding Avro manually) or adding the serializer bean only for the internal topic — whichever keeps things cleaner without touching the SBP flow.
+
+Just wanted to share the root cause so it’s clear this isn’t anything personal or major — more of a config mismatch between Photon’s defaults and our custom factory.
