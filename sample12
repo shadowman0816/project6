@@ -278,3 +278,16 @@ private Event mapGeneric(GenericRecord gr, ConsumerRecord<String, ?> rec) {
     e.setMessageBody(body);
     return e;
 }
+@KafkaListener(
+  topics = "${k.internal.topic}",
+  groupId = "${k.internal.group}",
+  properties = {
+    "key.deserializer=org.apache.kafka.common.serialization.StringDeserializer",
+    "value.deserializer=io.confluent.kafka.serializers.KafkaAvroDeserializer",
+    "schema.registry.url=${schema.registry.url}",
+    "specific.avro.reader=false"
+  }
+)
+public void onMessage(ConsumerRecord<String, org.apache.avro.generic.GenericRecord> rec) {
+  // same as above
+}
