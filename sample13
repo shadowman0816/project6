@@ -1,0 +1,42 @@
+import org.apache.avro.io.BinaryDecoder;
+import org.apache.avro.io.DecoderFactory;
+import org.apache.avro.io.DatumReader;
+import org.apache.avro.specific.SpecificDatumReader;
+
+public PayrollManagementProcessingEventReceived decode(byte[] bytes) throws IOException {
+    DatumReader<PayrollManagementProcessingEventReceived> reader =
+            new SpecificDatumReader<>(PayrollManagementProcessingEventReceived.class);
+
+    BinaryDecoder decoder = DecoderFactory.get().binaryDecoder(bytes, null);
+    return reader.read(null, decoder);
+}
+
+@KafkaListener(
+    topics = "${kafka.consumers.internal.topic}",
+    groupId = "${kafka.consumers.internal.groupId}"
+)
+public void onMessage(ConsumerRecord<String, byte[]> record) {
+    log.info("Internal KSaaS event received: topic={} partition={} offset={} len={}",
+             record.topic(), record.partition(), record.offset(),
+             record.value() != null ? record.value().length : -1);
+
+    if (record.value() == null) {
+        log.warn("Internal KSaaS event has null value, skipping");
+        return;
+    }
+
+    try {
+        PayrollManagementProcessingEventReceived avro = decode(record.value());
+
+        // Now you *know* the bytes were a valid Avro message of the expected schema.
+        Event event = eventMapper.fromAvro(avro, record); // your mapper to internal Event
+        eventProcessorService.processEvent(event);
+        postProcess(event, false);
+
+    } catch (Exception e) {
+        log.error("Failed to decode Internal KSaaS event at partition={} offset={}",
+                  record.partition(), record.offset(), e);
+        postProcess(null, true);
+        // optionally rethrow if you want DefaultErrorHandler to kick in
+    }
+}
