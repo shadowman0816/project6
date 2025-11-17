@@ -1,0 +1,67 @@
+package net.jpmchase.payroll.processor.utils;
+
+import net.jpmc.ccb.business_banking.payments.payroll_management.PayrollManagementProcessingEventReceived;
+import net.jpmchase.payroll.processor.mapper.EventMapper;
+import net.jpmchase.payroll.processor.model.Event;
+import org.apache.avro.io.BinaryEncoder;
+import org.apache.avro.io.EncoderFactory;
+import org.apache.avro.specific.SpecificDatumWriter;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+
+public class SampleKafkaProducer {
+
+    public static void main(String[] args) throws Exception {
+
+        // 1) Build a sample Avro event (use whatever values you like)
+        PayrollManagementProcessingEventReceived event =
+                PayrollManagementProcessingEventReceived.newBuilder()
+                        .setEventIdentifier("7714d40b-7f8b-48aa-880b-9827c9240cb2")
+                        .setEventProcessTimestamp(System.currentTimeMillis())
+                        .setEventTypeName("payroll.processed")
+                        .setEntityTypeName("PAYROLL")
+                        .setEntityIdentifier("41d20cdc-3694-4426-8897-8eaebb01e32c")
+                        .setResourceTypeName("COMPANY")
+                        .setResourceIdentifier("ab80909b-08ee-4c3a-b578-c084f1ce04ff")
+                        .build();
+
+        // 2) Serialize to **raw Avro bytes** (no Confluent header yet)
+        byte[] rawAvroBytes;
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            SpecificDatumWriter<PayrollManagementProcessingEventReceived> writer =
+                    new SpecificDatumWriter<>(PayrollManagementProcessingEventReceived.class);
+
+            BinaryEncoder encoder = EncoderFactory.get().binaryEncoder(out, null);
+            writer.write(event, encoder);
+            encoder.flush();
+
+            rawAvroBytes = out.toByteArray();
+        }
+
+        // 3) Wrap in **Confluent wire format**: [magic (1 byte)] + [schemaId (4 bytes)] + [raw Avro]
+        // Use any dummy schema id here – your decoder will ignore it and just skip the first 5 bytes.
+        int schemaId = 1;
+        ByteBuffer buffer = ByteBuffer.allocate(1 + 4 + rawAvroBytes.length);
+        buffer.put((byte) 0);      // magic byte
+        buffer.putInt(schemaId);   // schema id
+        buffer.put(rawAvroBytes);  // real Avro payload
+
+        byte[] confluentBytes = buffer.array();
+
+        // 4) Build a fake ConsumerRecord with the Confluent-formatted payload
+        ConsumerRecord<String, byte[]> record =
+                new ConsumerRecord<>("test-topic", 0, 0L, "key", confluentBytes);
+
+        // (Optional) add headers if you want to simulate real message headers
+        // record.headers().add("x-correlation-id", "local-test".getBytes(StandardCharsets.UTF_8));
+        // KsaasHeaderUtil.addHeaders(record, ...);
+
+        // 5) Call your EventMapper / listener to verify the decoding logic
+        EventMapper mapper = new EventMapper();
+        Event mapped = mapper.fromRecord(record);   // this should call your decode() that skips 5 bytes
+
+        System.out.println("Decoded event = " + mapped);
+    }
+}
