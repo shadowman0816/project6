@@ -54,3 +54,121 @@ public class KafkaAuthRetryConfig {
         };
     }
 }
+
+package net.jpmchase.payroll.processor.common.config;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+import java.time.Duration;
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.config.BeanPostProcessor;
+import org.springframework.boot.autoconfigure.kafka.ConcurrentKafkaListenerContainerFactoryConfigurer;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.test.util.ReflectionTestUtils;
+
+public class KsaasContainerConfigTest {
+
+    @Test
+    void defaultFactory_shouldCreateFactoryAndInvokeConfigurer() {
+        // Arrange
+        KsaasContainerConfig config = new KsaasContainerConfig();
+
+        @SuppressWarnings("unchecked")
+        ConcurrentKafkaListenerContainerFactoryConfigurer configurer =
+                mock(ConcurrentKafkaListenerContainerFactoryConfigurer.class);
+
+        @SuppressWarnings("unchecked")
+        ConsumerFactory<Object, Object> consumerFactory =
+                mock(ConsumerFactory.class);
+
+        // Act
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory =
+                config.defaultFactory(configurer, consumerFactory);
+
+        // Assert
+        assertNotNull(factory, "Factory must not be null");
+        verify(configurer, times(1)).configure(factory, consumerFactory);
+        verifyNoMoreInteractions(configurer);
+    }
+
+    @Test
+    void kafkaFactoryPostProcessor_shouldSetContainerCustomizerOnKafkaFactories() {
+        // Arrange
+        KsaasContainerConfig config = new KsaasContainerConfig();
+        long expectedSeconds = 42L;
+        // Set the private @Value field manually for the test
+        ReflectionTestUtils.setField(
+                config,
+                "authExceptionRetryIntervalSeconds",
+                expectedSeconds
+        );
+
+        BeanPostProcessor postProcessor = config.kafkaFactoryPostProcessor();
+
+        @SuppressWarnings("unchecked")
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory =
+                spy(new ConcurrentKafkaListenerContainerFactory<>());
+
+        // Act
+        Object result = postProcessor.postProcessAfterInitialization(factory, "kafkaListenerContainerFactory");
+
+        // Assert
+        // The bean itself must be returned
+        org.junit.jupiter.api.Assertions.assertNotNull(result);
+        org.junit.jupiter.api.Assertions.assertSame(factory, result);
+
+        // Verify that setContainerCustomizer was called with some lambda
+        verify(factory, times(1)).setContainerCustomizer(any());
+
+        // Optional: verify that the lambda uses the configured seconds value.
+        // We capture the argument and invoke it against a real container instance.
+        @SuppressWarnings("unchecked")
+        var customizerCaptor =
+                org.mockito.ArgumentCaptor.forClass(
+                        org.springframework.kafka.config.ContainerCustomizer.class);
+
+        verify(factory).setContainerCustomizer(customizerCaptor.capture());
+
+        var customizer = customizerCaptor.getValue();
+        // Build a minimal container to apply the customizer to
+        var containerProps = new org.springframework.kafka.listener.ContainerProperties("dummy-topic");
+        var consumerFactory = mock(ConsumerFactory.class);
+        var container =
+                new org.springframework.kafka.listener.ConcurrentMessageListenerContainer<>(
+                        consumerFactory, containerProps);
+
+        // Act: apply the customizer
+        //noinspection unchecked
+        customizer.configure(container);
+
+        Duration actual = container.getContainerProperties().getAuthExceptionRetryInterval();
+        org.junit.jupiter.api.Assertions.assertEquals(
+                Duration.ofSeconds(expectedSeconds),
+                actual,
+                "Auth exception retry interval must match configured seconds"
+        );
+    }
+
+    @Test
+    void kafkaFactoryPostProcessor_shouldIgnoreNonFactoryBeans() {
+        // Arrange
+        KsaasContainerConfig config = new KsaasContainerConfig();
+        ReflectionTestUtils.setField(config,
+                "authExceptionRetryIntervalSeconds",
+                30L);
+
+        BeanPostProcessor postProcessor = config.kafkaFactoryPostProcessor();
+
+        Object someOtherBean = new Object();
+
+        // Act
+        Object result = postProcessor.postProcessAfterInitialization(someOtherBean, "someOtherBean");
+
+        // Assert: bean is returned unchanged and no exceptions are thrown
+        org.junit.jupiter.api.Assertions.assertSame(someOtherBean, result);
+    }
+}
