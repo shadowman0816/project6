@@ -1,0 +1,56 @@
+package com.yourcompany.payroll.config;
+
+import java.time.Duration;
+
+import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.config.BeanPostProcessor;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.kafka.ConcurrentKafkaListenerContainerFactoryConfigurer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+
+@Configuration
+public class KafkaAuthRetryConfig {
+
+    @Value("${kafka.auth-exception-retry-interval-seconds:60}")
+    private long interval;
+
+    @Bean
+    @ConditionalOnMissingBean(ConcurrentKafkaListenerContainerFactory.class)
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> defaultFactory(
+            ConcurrentKafkaListenerContainerFactoryConfigurer configurer,
+            ConsumerFactory<Object, Object> consumerFactory) {
+
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+
+        configurer.configure(factory, consumerFactory);
+
+        return factory;
+    }
+
+    @Bean
+    public BeanPostProcessor kafkaFactoryPostProcessor() {
+        return new BeanPostProcessor() {
+
+            @Override
+            public Object postProcessAfterInitialization(Object bean, String beanName)
+                    throws BeansException {
+
+                if (bean instanceof ConcurrentKafkaListenerContainerFactory<?, ?> factory) {
+
+                    factory.setContainerCustomizer(container ->
+                            container.getContainerProperties()
+                                     .setAuthExceptionRetryInterval(
+                                             Duration.ofSeconds(interval)
+                                     ));
+                }
+
+                return bean;
+            }
+        };
+    }
+}
