@@ -65,3 +65,65 @@ public class SampleKafkaProducer {
         System.out.println("Decoded event = " + mapped);
     }
 }
+@Configuration
+public class KafkaAuthRetryCustomizer {
+
+    @Value("${kafka.auth-exception-retry-interval-seconds:60}")
+    private long authExceptionRetryIntervalSeconds;
+
+    // Inject the existing factory created by Boot / your config
+    public KafkaAuthRetryCustomizer(
+            ConcurrentKafkaListenerContainerFactory<?, ?> kafkaListenerContainerFactory) {
+
+        kafkaListenerContainerFactory.setContainerCustomizer(container ->
+                container.getContainerProperties()
+                         .setAuthExceptionRetryInterval(
+                                 Duration.ofSeconds(authExceptionRetryIntervalSeconds)));
+    }
+}
+
+package com.yourcompany.yourapp.config;
+
+import java.time.Duration;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.kafka.ConcurrentKafkaListenerContainerFactoryConfigurer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+
+@Configuration
+public class KafkaAuthRetryConfig {
+
+    /**
+     * Custom property from application-*.yml.
+     * Default 60s to avoid NPE if the property is not set.
+     */
+    @Value("${kafka.auth-exception-retry-interval-seconds:60}")
+    private long authExceptionRetryIntervalSeconds;
+
+    /**
+     * Override the default kafkaListenerContainerFactory bean while still
+     * letting Spring Boot apply all spring.kafka.* properties for you.
+     */
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> kafkaListenerContainerFactory(
+            ConcurrentKafkaListenerContainerFactoryConfigurer configurer,
+            ConsumerFactory<Object, Object> consumerFactory) {
+
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+
+        // This line applies all your existing spring.kafka.* config
+        configurer.configure(factory, consumerFactory);
+
+        // 🔑 This is the important part: set authExceptionRetryInterval via a container customizer
+        factory.setContainerCustomizer(container ->
+                container.getContainerProperties()
+                         .setAuthExceptionRetryInterval(
+                                 Duration.ofSeconds(authExceptionRetryIntervalSeconds)));
+
+        return factory;
+    }
+}
