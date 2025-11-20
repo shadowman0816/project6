@@ -1,0 +1,60 @@
+package com.yourcompany.payroll.config; // change to your package
+
+import java.time.Duration;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.kafka.ConcurrentKafkaListenerContainerFactoryConfigurer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.listener.AbstractMessageListenerContainer;
+import org.springframework.kafka.listener.ListenerContainerCustomizer;
+
+/**
+ * 360° Kafka auth-exception retry interval configuration.
+ * - If a factory already exists (Boot/KSAS) -> customize it.
+ * - If no factory exists -> create one and customize it.
+ */
+@Configuration
+public class KafkaAuthRetryConfig {
+
+    @Value("${kafka.auth-exception-retry-interval-seconds:60}")
+    private long authExceptionRetryIntervalSeconds;
+
+    /**
+     * Fallback factory: only created if no other ConcurrentKafkaListenerContainerFactory
+     * exists in the context.
+     */
+    @Bean
+    @ConditionalOnMissingBean(ConcurrentKafkaListenerContainerFactory.class)
+    public ConcurrentKafkaListenerContainerFactory<Object, Object> defaultKafkaListenerContainerFactory(
+            ConcurrentKafkaListenerContainerFactoryConfigurer configurer,
+            ConsumerFactory<Object, Object> consumerFactory) {
+
+        ConcurrentKafkaListenerContainerFactory<Object, Object> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+
+        // Apply all standard spring.kafka.* properties
+        configurer.configure(factory, consumerFactory);
+
+        // No need to set customizer here; one global customizer bean below covers all factories
+        return factory;
+    }
+
+    /**
+     * GLOBAL customizer that applies to *all* Kafka listener containers
+     * regardless of how/where the factory was created.
+     *
+     * This is the preferred solution over BeanPostProcessor.
+     */
+    @Bean
+    public ListenerContainerCustomizer<AbstractMessageListenerContainer<?, ?>> kafkaAuthRetryCustomizer() {
+        return (container, dest, group) -> {
+            container.getContainerProperties().setAuthExceptionRetryInterval(
+                    Duration.ofSeconds(authExceptionRetryIntervalSeconds)
+            );
+        };
+    }
+}
