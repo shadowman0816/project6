@@ -1,0 +1,226 @@
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+1
+payroll.processed
+First-time processing. Message received from Event Manager. No corresponding RetryOutbox row exists.
+Processor Service
+Processor must execute all steps 1–10 in order. retryEnabled=false on ReadIncomingPayrollEvent means failures there do not create retry entries. Conditional steps (GeneratePIMIdentifier, CancelPayrollInGustoWhenValidationFailed) run only if their executeOnCondition evaluates to true.
+2
+payroll.processed
+First-time processing; validation passes (no business failures).
+Processor Service
+Steps 1–7 and 9–10 must run. CancelPayrollInGustoWhenValidationFailed must not execute (condition false). No RetryOutbox row created.
+3
+payroll.processed
+First-time processing; a validation step fails (e.g. ValidateCustomerInternalEligibility), throwing BusinessValidationException.
+Processor Service
+Workflow must stop after failing step, not call SendRequestToPIM or disbursement step. CancelPayrollInGustoWhenValidationFailed must execute (condition true) and issue cancel to Gusto. A RetryOutbox row should be created with lastFailedStep set to the step that threw and status=READY for SAF.
+4
+payroll.processed
+SAF re-drive for a payroll where RetryOutbox has lastFailedStep = ValidatePayrollProcessingWindow. SAF config default startPolicy=START_FROM_FIRST applies.
+Processor Service
+On receiving the re-driven payroll.processed event from Recon, processor must ignore lastFailedStep for default policy and re-execute full chain 1–10 from the beginning. All non-idempotent effects should be idempotent-safe (DB upserts, PIM idempotency keys etc.). lastFailedStep in RetryOutbox should be updated if another failure occurs.
+5
+payroll.processed
+SAF re-drive where RetryOutbox has lastFailedStep = SendRequestToPIM. In SAF YAML, step SendRequestToPIM has startPolicy=START_WITH_SKIP, skipSteps=[PersistPayrollHierarchyToDatabase].
+Processor Service
+When event is re-driven, processor should start from the first step, but never execute PersistPayrollHierarchyToDatabase again. All other steps (1–6, 8, 9–10) must run in order. Verify via logs that PersistPayrollHierarchyToDatabase is skipped exactly once and that the workflow still completes with PIM call and reconciliation.
+6
+payroll.processed
+SAF re-drive where RetryOutbox has lastFailedStep = PersistPayrollHierarchyToDatabase. Default policy is START_FROM_FIRST, and there is no step-level override for this step.
+Processor Service
+Processor must re-run full workflow 1–10 from the beginning, including PersistPayrollHierarchyToDatabase. Confirms that only steps with an explicit SAF override (SendRequestToPIM, GustoDisbursementReconciliationForPayroll) get special behaviour.
+7
+payroll.processed
+SAF re-drive where RetryOutbox has lastFailedStep = GustoDisbursementReconciliationForPayroll. SAF YAML for GustoDisbursementReconciliationForPayroll has startPolicy=RETRY_FROM_FAILED, includeSteps=[ReadIncomingPayrollEvent, GeneratePIMIdentifier].
+Processor Service
+Processor must execute only the includeSteps + target step: ReadIncomingPayrollEvent, (conditionally GeneratePIMIdentifier if condition true), then GustoDisbursementReconciliationForPayroll. Earlier steps like validations, reconciliation, persistence, and SendRequestToPIM must not be re-executed. RetryOutbox row should be updated/closed accordingly.
+8
+payroll.processed
+SAF re-drive where RetryOutbox lastFailedStep is some step after GustoDisbursementReconciliationForPayroll (e.g. hypothetical new step), but configuration still has RETRY_FROM_FAILED on GustoDisbursementReconciliationForPayroll only.
+Processor Service
+Engine should fall back to default START_FROM_FIRST for steps that don’t have a matching step override. The workflow must begin at ReadIncomingPayrollEvent and run through to the end, ignoring the mismatched target.
+9
+payroll.processed
+SAF re-drive for payroll.processed but no SAF config exists (simulate by temporarily removing event from application-processor-saf.yml while strict=true).
+Processor Service
+With strict=true, processor must fail fast with a configuration error (e.g. ProcessorException type FATAL / config), log that SAF config is missing, and not execute any business steps. Confirms that unsupported SAF events cannot accidentally run with default behaviour.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+10
+payroll.cancelled
+First-time processing.
+Processor Service
+Processor executes steps 1–4 in order. If all succeed, no RetryOutbox row is created.
+11
+payroll.cancelled
+SAF re-drive where RetryOutbox has lastFailedStep = PersistPayrollCancellationToDatabase. Default START_FROM_FIRST.
+Processor Service
+Processor must re-run full chain 1–4 from the beginning (read → validate → persist → send to PIM). Confirms that for this event every SAF run always restarts from step 1 regardless of lastFailedStep.
+12
+payroll.cancelled
+SAF re-drive where RetryOutbox has lastFailedStep = SendCancellationToPIM. Default START_FROM_FIRST.
+Processor Service
+Again, re-run full chain 1–4. Ensure that DB persistence logic is idempotent (no duplicate rows) and that PIM call handles idempotency (e.g. same instruction ID).
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+13
+payroll.saf.cancel
+SAF cancel event received from Recon Manager (first-time).
+Processor Service
+Processor runs steps 1–2 exactly once and does not send any new request to PIM or create additional RetryOutbox rows on success.
+14
+payroll.saf.cancel
+SAF re-drive where previous SAF cancel failed at CancelPayrollInGustoWhenValidationFailed and RetryOutbox has lastFailedStep set accordingly.
+Processor Service
+With START_FROM_FIRST, processor re-runs both steps 1–2 in order. Gusto cancel call must be idempotent (same external reference).
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+15
+contractor_payment_group.created
+First-time processing, all validations pass.
+Processor Service
+Processor executes all steps 1–10 in order. Conditional steps behave per their conditions. No RetryOutbox row on success.
+16
+contractor_payment_group.created
+First-time processing; validation fails in ValidatePaymentProcessingWindow or ValidateEmployerEligibilityForContractorPayments.
+Processor Service
+Workflow stops at failing step; CancelPaymentInGustoWhenValidationFailed must run; PIM request and disbursement steps must not run. A RetryOutbox row should be created with correct lastFailedStep and group/event identifiers.
+17
+contractor_payment_group.created
+SAF re-drive where RetryOutbox lastFailedStep = ValidatePaymentProcessingWindow or similar early step. Default START_FROM_FIRST.
+Processor Service
+Processor re-runs full chain 1–10 from the beginning. Confirms default policy is honoured and steps are idempotent.
+18
+contractor_payment_group.created
+SAF re-drive where RetryOutbox lastFailedStep = SendContractorGroupRequestToPIM. SAF config for this step: START_WITH_SKIP with skipSteps=[PersistPaymentHierarchyToDatabase].
+Processor Service
+Processor must start from the first step, but skip PersistPaymentHierarchyToDatabase, executing all other steps. Check via logs that PersistPaymentHierarchyToDatabase is not invoked on the SAF run while earlier validations and reconciliation still execute before sending the PIM request and disbursement reconciliation.
+19
+contractor_payment_group.created
+SAF re-drive where RetryOutbox lastFailedStep = GustoDisbursementReconciliationForPayment. SAF config: RETRY_FROM_FAILED + includeSteps=[ReadIncomingPaymentProcessingEvent, GenerateContractorPIMIdentifier].
+Processor Service
+Processor must execute only the includeSteps + target step: ReadIncomingPaymentProcessingEvent, GenerateContractorPIMIdentifier (if condition true), and GustoDisbursementReconciliationForPayment. Earlier steps like Gusto fetch, eligibility, reconciliation, persistence, and PIM request must not be re-run.
+20
+contractor_payment_group.created
+SAF re-drive, but SAF config for this event is temporarily removed while strict=true.
+Processor Service
+Processor must reject the SAF run with a configuration error and not execute any business steps. Confirms strict SAF enforcement for contractor group events.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+21
+contractor_payment.cancelled
+First-time processing, all steps succeed.
+Processor Service
+Processor runs steps 1–6 in order, and no RetryOutbox entry is created.
+22
+contractor_payment.cancelled
+SAF re-drive, RetryOutbox lastFailedStep = ValidatePaymentCancellation.
+Processor Service
+Default START_FROM_FIRST → processor re-runs full chain 1–6 from the beginning.
+23
+contractor_payment.cancelled
+SAF re-drive, RetryOutbox lastFailedStep = SendCancellationToPIM.
+Processor Service
+Again, re-run full chain. Confirm PIM cancellation API is idempotent and DB writes are safe on duplicate attempts.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+24
+contractor_payment.saf.cancel
+SAF cancel event received from Recon Manager (first-time).
+Processor Service
+Processor executes steps 1–2 once, cancelling in Gusto as needed; no further RetryOutbox inserts on success.
+25
+contractor_payment.saf.cancel
+SAF re-drive where previous run failed at CancelPaymentInGustoWhenValidationFailed; RetryOutbox lastFailedStep is set.
+Processor Service
+With START_FROM_FIRST, processor re-runs both steps 1–2. External cancel must be idempotent and the RetryOutbox row updated.
+
+No
+Event Type (example)
+Scenario
+System
+Expected (RetryOutbox assertions)
+Actual
+Status
+Evidence
+1
+payroll.cancelled
+SAF replay attempt fails with retryable (INFRA) exception in some step (e.g. SendCancellationToPIM). retryCount in RetryOutbox row is currently N.
+Processor Service
+1. Processor throws ProcessorExceptionType.INFRA_RETRYABLE from the failing step. 2. RetryOutbox row for this event is updated with:• retryCount = N + 1.• lastFailedStepName = <failing step name>.• status = READY (or PENDING_RETRY – whatever your code uses for “still eligible for re-drive”).• statusMessage (or comment) captures the infra error (e.g. “Replay failed due to infra error …”). No “successfully processed” flags are set.
+2
+payroll.cancelled
+SAF replay attempt eventually succeeds (all workflow steps complete without exception). retryCount before this attempt was N.
+Processor Service
+1. All configured steps for this event complete successfully.2. RetryOutbox row is updated with:• retryCount = N + 1 (we still count that we tried one more time).• lastFailedStepName cleared or set to final step name depending on design.• status = SUCCESS (or equivalent) – “successfully processed”.• statusMessage = "Successfully replayed and processed" (or similar wording you mentioned).3. Row is no longer picked by Recon Manager for further retries.
+3
+payroll.cancelled
+SAF replay attempt fails with a non-retryable / business / unknown exception (e.g. ProcessorExceptionType.BUSINESS_VALIDATION or generic).
+Processor Service
+1. Processor throws non-retryable exception type.2. RetryOutbox row is updated with:• retryCount = previousRetryCount + 1.• lastFailedStepName = <failing step>.• status = FAILED (or whatever you use for terminal failure).• statusMessage clearly says “Successfully replayed but failed with exception …” (your wording: “successfully replayed but failed”).3. Recon Manager must not re-drive this record again (terminal state).
+4
+payroll.saf.cancel
+SAF replay of SAF cancel event fails with infra exception; record is still within maxRetryCount.
+Processor Service
+Same as test 1 but for a *.saf.cancel event:• retryCount incremented by 1.• lastFailedStepName updated.• status left as READY/PENDING_RETRY.• Error details captured.Confirms that even cancellation flows correctly bump retryCount and remain eligible for another recon run until maxRetryCount/cutoff is hit.
+5
+contractor_payment_group.created
+SAF replay of contractor payment group creation succeeds after one or more previous failures (e.g. now PIM is up).
+Processor Service
+• retryCount incremented by 1 for this last successful attempt.• status = SUCCESS (or “successfully processed”).• statusMessage = "Successfully replayed and processed".• Row is no longer selected by Recon Manager (confirm via next SAF scan – row not picked).
+6
+contractor_payment_group.created
+SAF replay fails with non-retryable error (e.g. validation bug) and this was already the last allowed retry (retryCount becomes maxRetryCount).
+Processor Service
+• retryCount = maxRetryCount after this run.• status = FAILED / terminal.• statusMessage = "Successfully replayed but failed with exception …" as you described.• Recon Manager must treat this as no more retries allowed (combined with recon-side tests you already have for “max retry reached → SAF cancel or terminal”).
+
+
+
+
+
+
+
+
+
