@@ -1,0 +1,426 @@
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+1
+payroll.processed
+Retry Outbox entity exists for today’s payroll with retryCount = 0, status = READY, and expiryTs > now (eg. > 1 hr from now).
+Recon Manager
+Recon Manager must publish the original payroll.processed event to Processor, increment retryCount from 0 → 1, and update Retry Outbox status to SENT.
+2
+payroll.processed
+Retry Outbox entity for today’s payroll with retryCount = 1, status = READY, and expiryTs > now.
+Recon Manager
+Recon Manager must publish the original payroll.processed event again, increment retryCount from 1 → 2, and set status = SENT.
+3
+payroll.processed
+Retry Outbox entity for today’s payroll with retryCount = 2, status = READY, and expiryTs > now.
+Recon Manager
+Recon Manager must publish the original payroll.processed event again, increment retryCount from 2 → 3, and set status = SENT.
+4
+payroll.processed
+Retry Outbox entity for today’s payroll with max retry reached: retryCount = 3, status = READY, and expiryTs > now. (This is the run where we stop retrying normal flow.)
+Recon Manager
+Recon Manager must publish a payroll.SAF.cancel event to Processor instead of payroll.processed, increment retryCount from 3 → 4, and set status = SENT for this Retry Outbox row.
+5
+payroll.processed
+Retry Outbox entity for today’s payroll where expiryTs <= now (expired window), any retryCount, status = READY.
+Recon Manager
+Recon Manager must NOT publish any event to Processor. It must mark the Retry Outbox entity as EXPIRED (or terminal state as per design) and leave no further retries scheduled for this record.
+6
+payroll.processed
+Retry Outbox entity for today’s payroll where status ≠ READY (e.g. SENT/EXPIRED) at SAF scan time.
+Recon Manager
+Recon Manager must skip this record (no publish, no change to retryCount). Confirms SAF picker only processes records in READY state.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+1
+payroll.processed
+Retry Outbox entity exists for today’s payroll with retryCount = 0, status = READY, and expiryTs > now (eg. > 1 hr from now).
+Recon Manager
+Recon Manager must publish the original payroll.processed event to Processor, increment retryCount from 0 → 1, and update Retry Outbox status to SENT.
+2
+payroll.processed
+Retry Outbox entity for today’s payroll with retryCount = 1, status = READY, and expiryTs > now.
+Recon Manager
+Recon Manager must publish the original payroll.processed event again, increment retryCount from 1 → 2, and set status = SENT.
+3
+payroll.processed
+Retry Outbox entity for today’s payroll with retryCount = 2, status = READY, and expiryTs > now.
+Recon Manager
+Recon Manager must publish the original payroll.processed event again, increment retryCount from 2 → 3, and set status = SENT.
+4
+payroll.processed
+Retry Outbox entity for today’s payroll with max retry reached: retryCount = 3, status = READY, and expiryTs > now. (This is the run where we stop retrying normal flow.)
+Recon Manager
+Recon Manager must publish a payroll.SAF.cancel event to Processor instead of payroll.processed, increment retryCount from 3 → 4, and set status = SENT for this Retry Outbox row.
+5
+payroll.processed
+Retry Outbox entity for today’s payroll where expiryTs <= now (expired window), any retryCount, status = READY.
+Recon Manager
+Recon Manager must NOT publish any event to Processor. It must mark the Retry Outbox entity as EXPIRED (or terminal state as per design) and leave no further retries scheduled for this record.
+6
+payroll.processed
+Retry Outbox entity for today’s payroll where status ≠ READY (e.g. SENT/EXPIRED) at SAF scan time.
+Recon Manager
+Recon Manager must skip this record (no publish, no change to retryCount). Confirms SAF picker only processes records in READY state.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+11
+payroll.SAF.cancel
+Retry Outbox entity for today’s SAF cancel with retryCount = 0, status = READY, expiryTs > now.
+Recon Manager
+Recon Manager must publish the payroll.SAF.cancel event to Processor, increment retryCount from 0 → 1, and set status = SENT.
+12
+payroll.SAF.cancel
+Retry Outbox entity for today’s SAF cancel with retryCount = 1 or 2, status = READY, expiryTs > now.
+Recon Manager
+Recon Manager must re-publish the payroll.SAF.cancel event to Processor, increment retryCount by 1, and set status = SENT.
+13
+payroll.SAF.cancel
+Retry Outbox entity for today’s SAF cancel with max retries reached (e.g. retryCount = 3), status = READY, expiryTs > now.
+Recon Manager
+Recon Manager must stop re-driving this cancel event and mark the Retry Outbox record as terminal (DEAD_LETTER/EXPIRED), with no further scheduling.
+14
+payroll.SAF.cancel
+Retry Outbox entity for today’s SAF cancel where expiryTs <= now, any retryCount, status = READY.
+Recon Manager
+Recon Manager must not publish any event and must mark the record as EXPIRED (or configured terminal status) so that it is not picked up again by SAF.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+7
+payroll.cancel
+Retry Outbox entity for today’s payroll cancel with retryCount = 0, status = READY, expiryTs > now.
+Recon Manager
+Recon Manager must publish the payroll.cancel event to Processor, increment retryCount from 0 → 1, and update status = SENT.
+8
+payroll.cancel
+Retry Outbox entity for today’s payroll cancel with retryCount = 1 or 2, status = READY, expiryTs > now.
+Recon Manager
+Recon Manager must re-publish the payroll.cancel event to Processor, increment retryCount by 1, and set status = SENT.
+9
+payroll.cancel
+Retry Outbox entity for today’s payroll cancel with max retries reached (e.g. retryCount = 3), status = READY, expiryTs > now.
+Recon Manager
+Recon Manager must not generate a new SAF cancel (because this is already a cancel). It must mark the record terminal – e.g. set status = DEAD_LETTER/EXPIRED and stop scheduling further retries.
+10
+payroll.cancel
+Retry Outbox entity for today’s payroll cancel where expiryTs <= now, any retryCount, status = READY.
+Recon Manager
+Recon Manager must not publish any event to Processor; it must mark the Retry Outbox entry as EXPIRED or equivalent terminal state and ensure there are no more retries for this cancel.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+1
+payroll.processed
+Future-dated payroll Retry Outbox entity exists with retryCount = 0, status = READY, expiryTs > now. SAF job triggered at 17:00 (within same-day window 00–18).
+Recon Manager
+SAF job for same-day window must ignore future-dated records: no publish to Processor, no change to retryCount or status. Confirms time-window segregation between same-day and future-dated jobs.
+2
+payroll.processed
+Future-dated payroll Retry Outbox entity with retryCount = 0, status = READY, expiryTs > now. SAF job triggered at 20:00 (within future-dated window 19–23:59).
+Recon Manager
+Recon Manager must publish the payroll.processed event for the future-dated payroll to Processor, increment retryCount 0 → 1, and set status = SENT.
+3
+payroll.processed
+Same as test 2 but with retryCount = 2, status = READY, expiryTs > now, SAF job at 21:00.
+Recon Manager
+Recon Manager must re-publish the payroll.processed event, increment retryCount 2 → 3, and set status = SENT.
+4
+payroll.processed
+Future-dated payroll Retry Outbox entity with max retries reached: retryCount = 3, status = READY, expiryTs > now, SAF job at 21:30.
+Recon Manager
+Recon Manager must publish a payroll.SAF.cancel event (for the future-dated payroll) instead of payroll.processed, increment retryCount 3 → 4, and set status = SENT.
+5
+payroll.processed
+Future-dated payroll Retry Outbox entity with status = READY, expiryTs <= now (expiry already passed), SAF job at 20:00 in future-dated window.
+Recon Manager
+Recon Manager must not publish any event. It must mark Retry Outbox entity as EXPIRED (or terminal state) and stop scheduling further retries for this record.
+6
+payroll.SAF.cancel
+Retry Outbox entity for future-dated SAF cancel with retryCount = 0, status = READY, expiryTs > now, SAF job at 20:15.
+Recon Manager
+Recon Manager must publish the payroll.SAF.cancel event to Processor, increment retryCount 0 → 1, and set status = SENT.
+7
+payroll.SAF.cancel
+Retry Outbox entity for future-dated SAF cancel with retryCount = 3 (max), status = READY, expiryTs > now, job at 21:45.
+Recon Manager
+Recon Manager must stop re-driving this SAF cancel: no further events to Processor after this run; mark the Retry Outbox entity as terminal (DEAD_LETTER/EXPIRED) so it is not picked up again.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+1
+contractorPaymentGroup.created
+Same-day contractor payment group Retry Outbox entity with retryCount = 0, status = READY, expiryTs > now, job at 10:00 (within 00–18 window).
+Recon Manager
+Recon Manager must publish the contractorPaymentGroup.created event to Processor, increment retryCount 0 → 1, and set status = SENT.
+2
+contractorPaymentGroup.created
+Same-day contractor payment group Retry Outbox entity with retryCount = 1 or 2, status = READY, expiryTs > now, job at 14:00.
+Recon Manager
+Recon Manager must re-publish the contractorPaymentGroup.created event, increment retryCount by 1, and set status = SENT.
+3
+contractorPaymentGroup.created
+Same-day contractor payment group Retry Outbox entity with max retries retryCount = 3, status = READY, expiryTs > now, job at 15:30.
+Recon Manager
+Recon Manager must publish contractorPaymentGroup.SAF.cancel instead of the create event, increment retryCount 3 → 4, and set status = SENT for that Retry Outbox row.
+4
+contractorPaymentGroup.created
+Same-day contractor payment group Retry Outbox entity with status = READY, expiryTs <= now, any retryCount, job at 12:00.
+Recon Manager
+Recon Manager must not publish any event and must mark the record as EXPIRED/terminal. No further retries should be scheduled.
+5
+contractorPaymentGroup.created
+Same-day contractor payment group Retry Outbox entity with status ≠ READY (e.g. SENT/EXPIRED) when job runs at 11:00.
+Recon Manager
+SAF job must skip this record: no publish, no retryCount change. Confirms we only process READY rows.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+6
+contractorPaymentGroup.cancel
+Same-day contractor group cancel Retry Outbox entity with retryCount = 0, status = READY, expiryTs > now, job at 09:30.
+Recon Manager
+Recon Manager must publish the contractorPaymentGroup.cancel event to Processor, increment retryCount 0 → 1, and set status = SENT.
+7
+contractorPaymentGroup.cancel
+Same-day contractor group cancel Retry Outbox entity with retryCount = 1 or 2, status = READY, expiryTs > now, job at 13:00.
+Recon Manager
+Recon Manager must re-publish the contractorPaymentGroup.cancel event, increment retryCount by 1, and set status = SENT.
+8
+contractorPaymentGroup.cancel
+Same-day contractor group cancel Retry Outbox entity with status = READY, expiryTs <= now, any retryCount, job at 15:00.
+Recon Manager
+Recon Manager must not publish any event; it should mark the Retry Outbox row as EXPIRED/terminal, with no further retries.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+9
+contractorPaymentGroup.SAF.cancel
+Same-day SAF cancel Retry Outbox entity with retryCount = 0, status = READY, expiryTs > now, job at 10:15.
+Recon Manager
+Recon Manager must publish the contractorPaymentGroup.SAF.cancel event to Processor, increment retryCount 0 → 1, and set status = SENT.
+10
+contractorPaymentGroup.SAF.cancel
+Same-day SAF cancel Retry Outbox entity with retryCount = 2, status = READY, expiryTs > now, job at 16:00.
+Recon Manager
+Recon Manager must re-publish the contractorPaymentGroup.SAF.cancel event, increment retryCount 2 → 3, and set status = SENT.
+11
+contractorPaymentGroup.SAF.cancel
+Same-day SAF cancel Retry Outbox entity with retryCount = 3 (max), status = READY, expiryTs > now, job at 17:30.
+Recon Manager
+Recon Manager must stop re-driving this record, mark Retry Outbox as terminal (DEAD_LETTER/EXPIRED) and ensure no further retries are scheduled.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+12
+contractorPaymentGroup.created
+Future-dated contractor group Retry Outbox entity, retryCount = 0, status = READY, expiryTs > now. SAF job at 11:00 (same-day window).
+Recon Manager
+Same-day SAF job must ignore future-dated contractor records: no publish to Processor, no modification to retryCount or status. Confirms segregation of same-day vs future-dated runs.
+13
+contractorPaymentGroup.created
+Same entity, job at 20:00 (future-dated window, 19–23:59).
+Recon Manager
+Recon Manager must publish contractorPaymentGroup.created event to Processor, increment retryCount 0 → 1, and set status = SENT.
+14
+contractorPaymentGroup.created
+Future-dated contractor group Retry Outbox entity with retryCount = 3 (max), status = READY, expiryTs > now, job at 21:15.
+Recon Manager
+Recon Manager must publish contractorPaymentGroup.SAF.cancel instead of the create event, increment retryCount 3 → 4, and set status = SENT.
+
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+15
+contractorPaymentGroup.cancel
+Future-dated contractor group cancel Retry Outbox entity, retryCount = 0, status = READY, expiryTs > now, job at 20:30.
+Recon Manager
+Recon Manager must publish contractorPaymentGroup.cancel to Processor, increment retryCount 0 → 1, and set status = SENT.
+16
+contractorPaymentGroup.cancel
+Same entity with expiryTs <= now, job still within 19–23:59 window.
+Recon Manager
+Recon Manager must not publish any event, and must mark Retry Outbox as EXPIRED/terminal, confirming expiry overrides even within the allowed time-of-day window.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+17
+contractorPaymentGroup.SAF.cancel
+Future-dated SAF cancel Retry Outbox entity with retryCount = 0, status = READY, expiryTs > now, job at 19:30.
+Recon Manager
+Recon Manager must publish the contractorPaymentGroup.SAF.cancel event to Processor, increment retryCount 0 → 1, and set status = SENT.
+18
+contractorPaymentGroup.SAF.cancel
+Same record with retryCount = 3 (max), status = READY, expiryTs > now, job at 22:00.
+Recon Manager
+Recon Manager must stop re-driving this SAF cancel and mark the Retry Outbox record as terminal (DEAD_LETTER/EXPIRED), with no further runs scheduled.
+
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+1
+payroll*/contractor*
+Company holiday (e.g. New Year). Retry Outbox has READY records for same-day payroll.processed and contractorPaymentGroup.created with expiryTs > now. Cron due at 10:00.
+Recon Manager
+Holiday check in code must short-circuit SAF job: no picking of outbox records, no publish to Processor, no change to retryCount or status. Confirms no SAF executions on holidays.
+2
+payroll*/contractor*
+Company holiday. Retry Outbox has READY records for same-day cancel and SAF.cancel events (payroll + contractor), expiryTs > now. Cron due at 15:00.
+Recon Manager
+Same as above: job must exit immediately due to holiday check; no events published and no DB updates on Retry Outbox rows.
+
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+3
+payroll*/contractor*
+Company holiday. Retry Outbox has READY future-dated records (payroll + contractor) with expiryTs > now. Future-dated SAF cron scheduled at 20:00 (19–23:59 window).
+Recon Manager
+Holiday check must prevent the future-dated SAF job from processing any records: no publishes, no retryCount changes, no status changes.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+4
+payroll*/contractor*
+Same-day SAF cron mis-triggered at 18:05 (after allowed window). Retry Outbox has READY same-day records with expiryTs > now.
+Recon Manager
+Time-window guard in code must detect current time > 18:00 and exit without processing: no reads from outbox, no publishes, no retryCount updates.
+5
+payroll*/contractor*
+Same-day SAF cron at 17:59. READY same-day records exist.
+Recon Manager
+Job is inside allowed 00:00–18:00 window: existing same-day tests (you already defined) must execute normally (events published, retryCount incremented). This test specifically validates the boundary behaviour.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+6
+payroll*/contractor*
+Future-dated SAF cron accidentally triggered at 18:15 (before 19:00). READY future-dated outbox records exist (expiryTs > now).
+Recon Manager
+Time-window guard must recognise current time < 19:00 and exit without processing: future-dated records stay untouched, no events published.
+7
+payroll*/contractor*
+Future-dated SAF cron triggered at 19:00 exactly. READY future-dated records exist.
+Recon Manager
+Job is now inside allowed 19:00–23:59 window: existing future-dated tests (you already defined) should run – records picked, events published, retryCount incremented. This asserts inclusive boundary at ≥ 19:00.
+8
+payroll*/contractor*
+Future-dated SAF cron mis-triggered at 00:30 (next day) outside both windows, future-dated records still READY and not expired.
+Recon Manager
+Guardrail must treat this as outside future-dated window (after 23:59 previous day, before next 19:00): job must exit without processing; no events, no retryCount changes, even though records are still technically valid.
+
+No
+Event Type
+Scenario
+System
+Expected
+Actual
+Status
+Evidence
+9
+payroll*/contractor*
+Holiday that is also a future-dated processing day. Same-day SAF cron at 10:00, future-dated SAF cron at 20:00, both have READY records (not expired).
+Recon Manager
+For both cron invocations, holiday guard must win over time-window guard: code should exit immediately in each job with no processing at all, proving holiday check is evaluated first.
+
+
+
+
+
+
+
+
+
+
