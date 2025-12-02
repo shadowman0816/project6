@@ -172,3 +172,77 @@ public class KsaasContainerConfigTest {
         org.junit.jupiter.api.Assertions.assertSame(someOtherBean, result);
     }
 }
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class RetryScheduleService {
+
+    private static final ZoneId EASTERN_TIMEZONE_ID = ZoneId.of("America/New_York");
+    private static final LocalTime FUTURE_DUE_DATE_EXPIRY_TIME = LocalTime.of(15, 0); // 3 PM
+    private static final String DELIVERY_DUE_DATE_CTX_KEY = "DELIVERY_DUE_DATE"; // TODO: use your real key
+
+    private final RetryOutboxRepository retryOutboxRepository;
+
+    // ... existing scheduleRetry(...) and saveRetry(...)
+
+    /**
+     * For future-dated payrolls:
+     *  - If deliveryDueDate > today (Eastern), expiry = deliveryDueDate @ 15:00 Eastern
+     * For all other cases:
+     *  - expiry = current backoff logic (cutoff/maxBackoffHours).
+     */
+    private Timestamp getExpiryTimestamp(final StepConfig stepConfig,
+                                         final WorkflowContext context) {
+
+        // Try to read delivery due date from context (assuming LocalDate; adjust if String)
+        LocalDate deliveryDueDate = null;
+        try {
+            deliveryDueDate = context.get(DELIVERY_DUE_DATE_CTX_KEY, LocalDate.class);
+        } catch (Exception ignore) {
+            // If you're storing it as String instead, uncomment this:
+            // String dateStr = context.get(DELIVERY_DUE_DATE_CTX_KEY, String.class);
+            // if (StringUtils.isNotBlank(dateStr)) {
+            //     deliveryDueDate = LocalDate.parse(dateStr);
+            // }
+        }
+
+        ZonedDateTime nowEastern = ZonedDateTime.now(EASTERN_TIMEZONE_ID);
+        LocalDate todayEastern = nowEastern.toLocalDate();
+
+        if (deliveryDueDate != null && deliveryDueDate.isAfter(todayEastern)) {
+            // Future-dated payroll ⇒ expiry at 3 PM Eastern on delivery date
+            ZonedDateTime expiryEastern =
+                    ZonedDateTime.of(deliveryDueDate, FUTURE_DUE_DATE_EXPIRY_TIME, EASTERN_TIMEZONE_ID);
+            return Timestamp.from(expiryEastern.toInstant());
+        }
+
+        // Same-day or past-dated ⇒ use existing backoff logic
+        return getEffectiveBackOffTime(stepConfig);
+    }
+
+    /**
+     * Existing method – unchanged.
+     * Keeps your "maxBackoffHours vs cutoffTime" behaviour.
+     */
+    private Timestamp getEffectiveBackOffTime(final StepConfig stepConfig) {
+        StepConfig.SafConfig safConfigs = stepConfig.getSafConfigs();
+        LocalTime now = LocalTime.now();
+        LocalTime maxBackOffTime = now.plusHours(safConfigs.getMaxBackOffHours());
+
+        if (safConfigs.getCutoffTime() == null) {
+            return Timestamp.from(
+                    LocalDateTime.of(LocalDate.now(), maxBackOffTime)
+                            .atZone(ZoneId.systemDefault())
+                            .toInstant());
+        }
+
+        LocalTime cutoff = LocalTime.parse(safConfigs.getCutoffTime());
+        LocalTime effectiveBackoffTime = maxBackOffTime.isAfter(cutoff) ? maxBackOffTime : cutoff;
+
+        return Timestamp.from(
+                LocalDateTime.of(LocalDate.now(), effectiveBackoffTime)
+                        .atZone(ZoneId.systemDefault())
+                        .toInstant());
+    }
+}
+
