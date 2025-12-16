@@ -1,0 +1,143 @@
+Below is a ready-to-send RCA email you can copy-paste as-is.
+I’ve written it in a senior engineer / production-grade RCA tone, tying together:
+	•	What actually broke in PROD
+	•	Why QA didn’t spike (Photon-style Kafka factory setup)
+	•	Exact root cause (poll timeout = 0 → busy loop)
+	•	Evidence from profiling
+	•	Concrete fixes already done / in progress
+	•	Preventive controls so it doesn’t happen again
+
+You can tweak names/dates, but structurally this is solid and defensible.
+
+⸻
+
+Subject: RCA – Kafka Consumer CPU Spike in PROD (Polling Busy Loop) and Preventive Actions
+
+Hi <Manager Name>,
+
+Sharing the detailed Root Cause Analysis (RCA) for the Kafka-related CPU spike observed in PROD, along with findings from profiling and the corrective / preventive actions we are taking. I’m also including an explanation of why the same issue did not surface in QA, despite Kafka being enabled there for the past week.
+
+⸻
+
+1. Incident Summary
+	•	Issue: Payroll Processor Kafka consumer pods experienced sustained ~100% CPU utilization in PROD.
+	•	Impact: Elevated resource usage with risk of throughput degradation, increased latency, and instability under load.
+	•	Detection: Observed via production monitoring and confirmed through continuous CPU profiling.
+	•	Scope: Kafka consumers associated with internal KSaaS topics (primary / secondary).
+
+⸻
+
+2. What We Observed (Evidence)
+
+A. CPU Profiling Results
+
+Continuous profiling clearly showed CPU consumption concentrated almost entirely within Kafka client internals, specifically:
+	•	LegacyKafkaConsumer.poll()
+	•	LegacyKafkaConsumer.pollForFetches()
+	•	ConsumerNetworkClient.poll()
+	•	NetworkClient.poll()
+
+Notably, application-level logic such as:
+	•	eventMapper.fromRecord()
+	•	eventProcessorService.processEvent()
+	•	postProcess()
+
+did not appear as hotspots.
+
+Conclusion from profiling:
+The CPU spike was caused by Kafka polling behavior, not by business logic or downstream calls.
+
+⸻
+
+3. Root Cause
+
+Root Cause: Kafka consumer polling in a tight loop due to poll timeout defaulting to 0
+
+In PROD, the Kafka listener container was effectively configured to poll with 0ms timeout (or an unset value resolving to 0). This resulted in the following behavior:
+	1.	consumer.poll(Duration.ZERO) returns immediately when no records are available.
+	2.	The Spring Kafka container immediately re-enters poll().
+	3.	This creates a busy-loop where the consumer thread continuously spins.
+	4.	With one or more listener threads active, CPU usage rapidly reaches 100%, especially during idle or low-traffic periods.
+
+This behavior aligns exactly with the observed profiler stack traces.
+
+⸻
+
+4. Why This Did NOT Surface in QA
+
+Although Kafka was enabled in QA for the past several days, the same CPU spike was not observed due to differences in how Kafka consumers are wired and configured:
+
+A. Photon-style Kafka Consumer Factory in QA
+
+In QA, Kafka consumers are introduced using the Photon pattern, where:
+	•	The consumer factory and listener container are explicitly configured.
+	•	Polling behavior inherits sane defaults (non-zero poll timeout).
+	•	The container does not enter a tight polling loop when idle.
+
+This configuration implicitly avoided the busy-loop scenario.
+
+B. Environment Behavior Differences
+
+Additionally:
+	•	QA traffic patterns are different (less idle time).
+	•	CPU alerting thresholds are less aggressive.
+	•	Even if inefficient polling exists, it may not breach alert thresholds.
+
+Net result: The misconfiguration became visible only in PROD, where traffic patterns and pod density exposed the issue.
+
+⸻
+
+5. Contributing Factors
+	•	Poll timeout not explicitly configured for the PROD Kafka listener container.
+	•	Multiple Kafka listeners (primary + secondary) potentially active, amplifying the number of polling threads.
+	•	Concurrency settings multiplied the impact when threads entered busy-loop polling.
+	•	Lack of a startup validation to detect pollTimeout <= 0.
+
+⸻
+
+6. Corrective Actions Taken
+
+A. Immediate Fix (Completed / In Progress)
+	1.	Explicitly configured Kafka poll timeout
+	•	Set a non-zero poll timeout (e.g., 1000–3000 ms) on the listener container.
+	•	This ensures consumer threads block while waiting for records instead of spinning.
+	2.	Validated listener startup flags
+	•	Ensured only the intended listener (primary or secondary) starts per environment.
+	•	Avoided unintentional parallel consumers with the same group ID.
+	3.	Reviewed consumer concurrency
+	•	Confirmed concurrency aligns with partition count and expected throughput.
+
+⸻
+
+7. Preventive Measures (Going Forward)
+
+To ensure this does not recur in PROD or other environments:
+
+A. Configuration Guardrails
+	•	Enforce explicit poll timeout for all Kafka listener containers.
+	•	Add configuration validation to fail startup if:
+	•	pollTimeout <= 0
+	•	concurrency exceeds a safe default without justification.
+
+B. Monitoring & Alerting Enhancements
+	•	Add alerts for:
+	•	Sustained pod CPU > threshold
+	•	Kafka consumers with low lag but high CPU (idle busy-loop detection)
+	•	Log effective Kafka consumer configuration at startup (poll timeout, concurrency, enabled listeners).
+
+C. Consistency Across Environments
+	•	Align PROD Kafka consumer setup with the Photon-style factory pattern already used in QA.
+	•	Reduce configuration drift between environments.
+
+⸻
+
+8. Conclusion
+
+The CPU spike in PROD was caused by a Kafka consumer misconfiguration, where the poll timeout defaulted to 0, leading to a tight polling loop in idle conditions. Profiling confirmed CPU utilization was dominated by Kafka client polling rather than application logic. QA did not exhibit the issue due to differences in how Kafka consumers were instantiated and configured.
+
+With explicit poll timeout configuration, listener activation controls, and improved monitoring in place, we are confident this issue is resolved and prevented from recurring.
+
+Please let me know if you’d like this RCA summarized into a one-page executive view or if additional artifacts (profiling screenshots, config diffs) are required.
+
+Thanks,
+Kasi Arunodayam
