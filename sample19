@@ -141,3 +141,23 @@ Please let me know if you’d like this RCA summarized into a one-page executive
 
 Thanks,
 Kasi Arunodayam
+
+spring:
+  kafka:
+    listener:
+      poll-timeout: 3000   # milliseconds
+
+consumer.poll(Duration.ZERO);  // returns immediately when no records
+
+while (isRunning()) {
+    try {
+        long pollTimeoutMs = containerProperties.getPollTimeout();
+        ConsumerRecords<K, V> records = consumer.poll(Duration.ofMillis(pollTimeoutMs));
+        invokeListener(records);
+    }
+    catch (WakeupException e) {
+        // shutdown / rebalance path
+    }
+}
+
+
