@@ -160,4 +160,26 @@ while (isRunning()) {
     }
 }
 
+response.messages().forEach(message -> {
 
+    final String messageGroupId =
+            message.hasAttributes() &&
+            message.attributes().containsKey(MessageSystemAttributeName.MESSAGE_GROUP_ID)
+                    ? message.attributes().get(MessageSystemAttributeName.MESSAGE_GROUP_ID)
+                    : "N/A";
+
+    // 🔹 Log message metadata + body
+    log.info(
+        "Received SQS message | messageId={} | messageGroupId={} | receiptHandle={} | body={}",
+        message.messageId(),
+        messageGroupId,
+        message.receiptHandle(),
+        message.body()
+    );
+
+    if (messageGroup.containsKey(messageGroupId)) {
+        messageGroup.get(messageGroupId).add(message);
+    } else {
+        messageGroup.put(messageGroupId, new ArrayList<>(List.of(message)));
+    }
+});
