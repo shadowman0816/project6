@@ -1,0 +1,422 @@
+Perfect — below is the complete, end-to-end technical document, written for software engineers (mid → senior).
+It is intentionally long-form, precise, and implementation-aligned with your code and YAML.
+You can drop this straight into Confluence / GitHub Docs / Word.
+
+⸻
+
+Payroll Processor Framework
+
+Technical Architecture & Execution Model
+
+⸻
+
+1. Purpose of This Document
+
+This document explains the Payroll Processor Framework from a software engineering perspective.
+
+It covers:
+	•	Why the framework exists
+	•	Core abstractions and responsibilities
+	•	Execution lifecycle
+	•	Configuration hierarchy
+	•	Retry & Store-And-Forward (SAF) mechanics
+	•	Exception taxonomy and handling
+	•	How to extend the framework safely
+
+This document assumes:
+	•	Familiarity with Java, Spring, Kafka-style eventing
+	•	No prior knowledge of this framework
+
+⸻
+
+2. Problem Statement
+
+Payroll and payment processing systems must handle:
+	•	Multiple event types
+	•	Ordered, stateful execution
+	•	External dependencies (Gusto, PIM, SBP)
+	•	Time-based constraints
+	•	Partial failures
+	•	Idempotency requirements
+	•	Auditability and replay
+
+Traditional approaches (hardcoded pipelines, chained service calls) fail because:
+	•	Retry logic becomes inconsistent
+	•	Failure semantics are unclear
+	•	Changes require redeployments
+	•	Debugging is non-deterministic
+
+The Payroll Processor Framework solves this by providing:
+	•	A config-driven execution engine
+	•	A deterministic step orchestration model
+	•	Explicit failure semantics
+	•	Centralized retry + SAF handling
+
+⸻
+
+3. High-Level Architecture
+
+Kafka / Source Event
+        |
+        v
+EventProcessorService
+        |
+        v
+WorkflowRegistry
+        |
+        v
+Ordered Step Execution
+        |
+        +--> Condition Evaluation
+        +--> Retry Handling
+        +--> SAF Scheduling
+        +--> Exception Classification
+        |
+        v
+Final Context State
+
+The engine never hardcodes business logic — all behavior is driven by configuration and step implementations.
+
+⸻
+
+4. Core Components
+
+4.1 EventProcessorService (Execution Engine)
+
+Responsibility
+	•	Orchestrates the entire lifecycle of an event
+	•	Executes steps sequentially
+	•	Applies retry, SAF, and exception semantics
+
+Key Responsibilities
+	•	Initialize WorkflowContext
+	•	Seed SAF metadata
+	•	Resolve workflow steps
+	•	Execute steps with retry
+	•	Handle exceptions centrally
+	•	Maintain final processing status
+
+Key Entry Point
+
+public void processEvent(Event event)
+
+Execution Flow
+	1.	Create new WorkflowContext
+	2.	Set status = INITIATED
+	3.	Store event + metadata in context
+	4.	Seed SAF
+	5.	Resolve steps via WorkflowRegistry
+	6.	Execute each step with retry
+	7.	Stop early if context status != SUCCESS
+	8.	Mark context COMPLETED
+
+⸻
+
+4.2 WorkflowContext (Execution State)
+
+Purpose
+	•	Acts as the single mutable state object during processing
+	•	Passed across all steps
+	•	Ensures consistency and traceability
+
+Contains
+	•	Event
+	•	Entity type
+	•	Event type
+	•	Current step name
+	•	Processing status
+	•	Control flags (e.g. CANCEL_GUSTO_PAYROLL)
+	•	Correlation IDs
+
+Why This Matters
+	•	Enables idempotent retries
+	•	Makes conditional logic deterministic
+	•	Centralizes execution metadata
+	•	Supports replay and audit use cases
+
+⸻
+
+5. Workflow Resolution
+
+5.1 WorkflowRegistry
+
+Responsibility
+	•	Maps (entityType, eventType) → ordered list of StepConfig
+	•	Applies retry & SAF config precedence
+
+Key Method
+
+List<StepConfig> getStepsForEvent(String entityType, String eventType)
+Resolution Logic
+	1.	Fetch GroupConfig by entityType
+	2.	Fetch step list by eventType
+	3.	Apply retry precedence
+	4.	Apply SAF precedence
+	5.	Return ordered steps
+
+⸻
+
+6. Configuration Model
+
+6.1 Hierarchy
+WorkflowConfig
+ └── GroupConfig (Entity)
+      └── Event
+           └── StepConfig
+
+
+⸻
+
+6.2 Precedence Rules (Critical)
+
+For RetryConfig and SafConfig:
+
+StepConfig > GroupConfig > WorkflowConfig
+
+This ensures:
+	•	Fine-grained overrides
+	•	Minimal duplication
+	•	Safe defaults
+
+⸻
+
+7. Configuration Classes
+
+7.1 WorkflowConfig
+boolean retryEnabled;
+RetryConfig retryConfigs;
+
+boolean safEnabled;
+SafConfig safConfigs;
+
+Map<String, GroupConfig> groups;
+
+Defines global defaults.
+
+⸻
+
+7.2 GroupConfig
+
+boolean retryEnabled;
+RetryConfig retryConfigs;
+
+boolean safEnabled;
+SafConfig safConfigs;
+
+Map<String, List<StepConfig>> events;
+
+Defines entity-level behavior.
+
+⸻
+
+7.3 StepConfig
+String name;
+String executeOnCondition;
+
+boolean retryEnabled;
+RetryConfig retryConfigs;
+
+boolean safEnabled;
+SafConfig safConfigs;
+
+Defines step-level behavior.
+
+⸻
+
+8. Retry Model
+
+8.1 RetryConfig
+
+String retryBackoffMs; // e.g. "100"
+int maxRetryCount;    // e.g. 3
+
+Execution Semantics
+	•	Retries happen inline
+	•	Retry counter maintained per step
+	•	Backoff applied between attempts
+	•	Exceeding retries escalates to exception handling
+
+⸻
+
+9. Store-and-Forward (SAF)
+
+9.1 SAFConfig
+boolean enabled;
+int maxBackoffHours;
+String cutoffTime;
+
+When SAF Triggers
+	•	Retry attempts exhausted
+	•	Exception classified as retryable
+	•	SAF enabled at step/group/workflow level
+
+Outcome
+	•	Event persisted for delayed retry
+	•	Execution exits safely
+	•	Replay resumes later
+
+⸻
+
+10. Conditional Execution
+
+10.1 ConditionRegistry
+
+Purpose
+	•	Allows steps to be executed conditionally
+	•	Decouples runtime logic from configuration
+
+Mechanism
+	•	Conditions are Spring beans
+	•	Registered via @Component("conditionName")
+	•	Resolved dynamically
+
+ExecutionCondition condition =
+    conditionRegistry.get(conditionName);
+Evaluation
+boolean shouldExecute = condition.evaluate(context);
+
+
+⸻
+
+11. Step Execution Flow
+
+For each step:
+	1.	Set MDC (eventId, companyId)
+	2.	Check SAF execution eligibility
+	3.	Evaluate executeOnCondition
+	4.	Execute step with retry loop
+	5.	On success → continue
+	6.	On exception → classify & handle
+
+⸻
+
+12. Exception Model
+
+12.1 ProcessorException
+
+All step failures are normalized into:
+
+ProcessorException {
+    ProcessorExceptionType type;
+    String message;
+}
+
+⸻
+
+12.2 Exception Types & Behavior
+
+Type
+Meaning
+Framework Action
+FATAL
+Unrecoverable
+Stop processing
+BUSINESS_VALIDATION
+Business rule failure
+Cancel downstream
+SYSTEM_RETRYABLE
+Infra failure
+Retry / SAF
+SKIPPABLE
+Non-critical
+Continue
+FLOW_HALT
+Intentional stop
+Mark completed
+SILENT_WARNING
+Log only
+Continue
+
+
+⸻
+
+13. Centralized Exception Handling
+
+All exceptions funnel through:
+
+handleException(
+  StepConfig stepConfig,
+  WorkflowContext context,
+  ProcessorException e,
+  String stepName,
+  int retryCount,
+  int maxRetries
+)
+Why This Matters
+	•	No step implements retry logic
+	•	No step decides final behavior
+	•	Engine enforces consistent semantics
+
+⸻
+
+14. Example Workflow (Payroll)
+workflow:
+  groups:
+    Payroll:
+      events:
+        payroll.processed:
+          - ReadIncomingPayrollEvent
+          - ValidatePayrollStatusFromGusto
+          - ValidateCustomerInternalEligibility
+          - ReconcileEmployeeWithSBP
+          - PersistPayrollHierarchyToDatabase
+          - CancelPayrollInGustoWhenValidationFailed
+          - SendRequestToPIM
+
+Each step:
+	•	Is ordered
+	•	Has isolated failure semantics
+	•	Can be retried or SAF’d independently
+
+⸻
+
+15. Observability
+	•	MDC logging with eventId + companyId
+	•	Step name logged on every attempt
+	•	Retry counts logged
+	•	SAF scheduling logged
+	•	Context state preserved
+
+Debugging is replayable and deterministic.
+
+⸻
+
+16. How to Add a New Workflow
+	1.	Add event in YAML
+	2.	Define ordered steps
+	3.	Configure retry / SAF if needed
+	4.	Implement Step beans
+	5.	Implement ExecutionCondition if required
+	6.	No engine changes needed
+
+⸻
+
+17. Design Principles
+	•	Configuration > Code
+	•	Centralized control
+	•	Deterministic execution
+	•	Explicit failure semantics
+	•	Safe retries
+	•	Auditable state
+
+⸻
+
+18. Summary
+
+The Payroll Processor Framework is:
+	•	A workflow orchestration engine
+	•	Designed for financial-grade reliability
+	•	Built to scale across payroll, contractor payments, and beyond
+
+It prioritizes correctness over convenience and clarity over shortcuts.
+
+⸻
+
+If you want next:
+	•	Sequence diagrams
+	•	Payroll-specific deep dive
+	•	Code walkthrough per class
+	•	1-page executive summary
+
+Just say the word.
+
