@@ -601,4 +601,305 @@ Use SAF when:
 
 Retry and SAF are not alternatives — they are complementary layers.
 
+Got it — this is an important conceptual gap and you’re right to call it out explicitly.
+Below is a Confluence-ready section you can append to the Processor / SAF docs.
+
+This explains, clearly and practically, the different replay / retry policies, how they behave, how config drives them, and when to use which — with a concrete example.
+
+You can paste this as-is into Confluence.
+
+⸻
+
+Retry & Replay Policies
+
+Execution Semantics, Configuration, and Usage
+
+
+⸻
+
+1. Why Replay Policies Exist
+
+When a workflow fails and is retried (either immediately or via SAF), the system must answer a critical question:
+
+Where should execution resume from?
+
+Blindly restarting everything or blindly resuming from the failure point can both be incorrect, depending on:
+	•	Side effects already committed
+	•	Idempotency guarantees
+	•	Business semantics
+	•	External system behavior
+
+To address this, the framework supports explicit replay policies.
+
+⸻
+
+2. Overview of Replay Policies
+
+The framework supports the following execution replay strategies:
+	1.	Restart from Beginning
+	2.	Restart from Beginning with Skipped Steps
+	3.	Resume from Failed Step (Last Failed Step)
+
+Each policy is intentional, config-driven, and deterministic.
+
+⸻
+
+3. Common Example Workflow (Used Below)
+
+Assume the following workflow for payroll.processed:
+
+1. ReadIncomingPayrollEvent
+2. ValidatePayrollStatusFromGusto
+3. ValidateCustomerInternalEligibility
+4. ReconcileEmployeeWithSBP
+5. PersistPayrollHierarchyToDatabase
+6. SendRequestToPIM
+
+Assume failure occurs at Step 4 (ReconcileEmployeeWithSBP).
+
+⸻
+
+4. Policy 1 — Restart from Beginning
+
+4.1 What It Means
+
+Every retry or SAF replay re-executes the workflow from Step 1, regardless of where the failure occurred.
+
+⸻
+
+4.2 Execution Flow
+Retry / SAF Replay
+   ↓
+Step 1
+Step 2
+Step 3
+Step 4 (fails again or succeeds)
+Step 5
+Step 6
+
+
+⸻
+
+4.3 When This Policy Is Appropriate
+
+Use this when:
+	•	All steps are idempotent
+	•	Earlier steps must be revalidated
+	•	External state may have changed
+	•	Business correctness > performance
+
+Typical use cases
+	•	Validation-heavy flows
+	•	Read-only or safe external calls
+	•	Stateless workflows
+
+⸻
+
+4.4 Risks
+	•	Repeated external calls
+	•	Higher latency
+	•	Increased dependency load
+
+⸻
+
+4.5 Conceptual Config (Illustrative)
+
+replayPolicy: START_FROM_BEGINNING
+
+
+⸻
+
+5. Policy 2 — Restart from Beginning with Skipped Steps (Soft Policy)
+
+5.1 What It Means
+
+Execution starts from Step 1, but steps that have already completed successfully are skipped automatically.
+
+This is often referred to as a “soft restart”.
+
+⸻
+
+5.2 Execution Flow
+
+Assume Steps 1–3 already succeeded.
+
+Retry / SAF Replay
+   ↓
+Step 1 (skipped)
+Step 2 (skipped)
+Step 3 (skipped)
+Step 4 (retry)
+Step 5
+Step 6
+
+
+⸻
+
+5.3 How Skipping Works
+	•	WorkflowContext tracks completed steps
+	•	SAF metadata persists execution state
+	•	Before executing a step, the framework checks:
+	•	Has this step already completed successfully?
+	•	Is the policy allowing skip?
+
+If yes → skip execution safely
+
+⸻
+
+5.4 When This Policy Is Appropriate (Most Common)
+
+Use this when:
+	•	Earlier steps have side effects
+	•	Re-running earlier steps is unsafe or expensive
+	•	You want safety without duplication
+
+Typical use cases
+	•	Database writes
+	•	Identifier generation
+	•	One-time external mutations
+	•	Financial state changes
+
+This is the recommended default policy for most payroll and payment flows.
+
+⸻
+
+5.5 Why This Is Called a “Soft Policy”
+	•	Execution logically restarts from the beginning
+	•	But physically avoids redoing completed work
+	•	Preserves determinism and safety
+
+⸻
+
+5.6 Conceptual Config (Illustrative)
+
+replayPolicy: START_FROM_BEGINNING_WITH_SKIPPED_STEPS
+
+
+⸻
+
+6. Policy 3 — Resume from Failed Step (Hard Resume)
+
+6.1 What It Means
+
+Execution resumes exactly from the last failed step, skipping everything before it unconditionally.
+
+⸻
+
+6.2 Execution Flow
+
+Retry / SAF Replay
+   ↓
+Step 4 (retry)
+Step 5
+Step 6
+
+
+⸻
+
+6.3 When This Policy Is Appropriate
+
+Use this when:
+	•	Prior steps are guaranteed complete
+	•	Prior steps are not safe to re-evaluate
+	•	Failure is isolated and well understood
+
+Typical use cases
+	•	Downstream notification failures
+	•	Post-persistence integrations
+	•	Idempotent downstream-only retries
+
+⸻
+
+6.4 Risks
+	•	Earlier validation is not rechecked
+	•	Assumes state consistency
+	•	Higher risk if misused
+
+This policy should be used sparingly and intentionally.
+
+⸻
+
+6.5 Conceptual Config (Illustrative)
+
+replayPolicy: RESUME_FROM_FAILED_STEP
+
+
+⸻
+
+7. How the Policy Flows Through the System
+
+7.1 At Failure Time
+	1.	Step fails
+	2.	Exception is classified
+	3.	Retry or SAF is triggered
+	4.	WorkflowContext persists:
+	•	Failed step name
+	•	Completed steps
+	•	Replay policy
+
+⸻
+
+7.2 At Replay Time
+	1.	Event is reloaded
+	2.	WorkflowContext is reconstructed
+	3.	Replay policy is evaluated
+	4.	Step iterator is adjusted accordingly
+	5.	Execution proceeds deterministically
+
+⸻
+
+8. How to Use a Soft Policy (Practically)
+
+8.1 When Someone Says “Use Soft Policy”, It Means:
+	•	Start from beginning
+	•	Skip already successful steps
+	•	Preserve side effects
+	•	Avoid duplication
+
+This is ideal for:
+	•	Payroll processing
+	•	Contractor payments
+	•	Multi-step financial workflows
+
+⸻
+
+8.2 What Must Be True to Use Soft Policy Safely
+
+To safely use START_FROM_BEGINNING_WITH_SKIPPED_STEPS:
+	1.	Steps must:
+	•	Record success explicitly
+	•	Be idempotent or skip-safe
+	2.	WorkflowContext must persist:
+	•	Step completion markers
+	3.	SAF replay must:
+	•	Rehydrate context correctly
+
+Your current framework already supports this.
+
+⸻
+
+9. Comparison of Policies (Quick Table)
+
+Policy
+Re-executes All
+Skips Completed
+Safe for Side Effects
+Typical Usage
+Start from Beginning
+✅
+❌
+❌
+Validation-heavy flows
+Start from Beginning + Skip
+⚠️ Logical only
+✅
+✅
+Default / Recommended
+Resume from Failed Step
+❌
+✅
+⚠️
+Isolated downstream failures
+
+
 
