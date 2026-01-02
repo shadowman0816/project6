@@ -1,0 +1,604 @@
+Perfect — I understand exactly what you want now 👍
+You want a second, standalone, engineer-grade document, just like the Processor Framework document, but entirely focused on SAF (Store-And-Forward).
+
+Below is a complete SAF Enablement Document, written so that:
+	•	Any software engineer can read it end-to-end
+	•	It can be pasted directly into Confluence
+	•	It clearly explains why SAF exists, how policies work, how code behaves, and how to extend it
+
+This document is aligned with your actual code (safService, RetryScheduleService, cutoff logic, step-level enablement, etc.), not theoretical.
+
+⸻
+
+Store-And-Forward (SAF) Enablement
+
+Architecture, Policies, and Execution Model
+
+⸻
+
+1. Purpose of This Document
+
+This document explains the Store-And-Forward (SAF) framework used within the Payroll Processor system.
+
+It is intended for:
+	•	Backend engineers
+	•	Platform engineers
+	•	On-call / support engineers
+	•	New team members
+
+This document complements the Processor Framework document and focuses only on:
+	•	SAF concepts
+	•	SAF policies
+	•	SAF execution flow
+	•	SAF configuration
+	•	SAF interaction with retries and exceptions
+
+⸻
+
+2. What Is SAF? (Engineering Definition)
+
+SAF (Store-And-Forward) is a controlled, delayed retry mechanism used when:
+	•	Immediate retries are exhausted or
+	•	Processing must be deferred due to time-based or operational constraints
+
+SAF ensures that:
+	•	No event is dropped
+	•	No processing happens outside allowed windows
+	•	Failures are retried safely and deterministically
+
+⸻
+
+3. Why SAF Is Required
+
+3.1 Why Immediate Retry Is Not Enough
+
+Immediate retry works for:
+	•	Temporary network failures
+	•	Short-lived dependency outages
+
+Immediate retry fails when:
+	•	External systems are down for hours
+	•	Cutoff times are exceeded
+	•	Business rules prohibit same-day execution
+
+⸻
+
+3.2 Problems SAF Solves
+Step Execution
+   |
+   +--> Immediate Retry
+           |
+           +--> Retry Exhausted
+                   |
+                   v
+              SAF Scheduling
+                   |
+                   v
+           Deferred Replay
+
+SAF is not separate from the processor — it is deeply integrated into step execution.
+
+⸻
+
+5. SAF Core Components
+
+5.1 SAF Service (SafService)
+
+Responsibilities
+	•	Decide whether a step should execute now
+	•	Decide whether execution should be skipped due to SAF
+	•	Seed SAF metadata
+	•	Coordinate replay eligibility
+
+Key Decisions
+	•	Should this step run?
+	•	Has this step already been deferred?
+	•	Has cutoff time passed?
+
+⸻
+
+5.2 RetryScheduleService
+
+Responsibilities
+	•	Persist retry metadata
+	•	Calculate next execution time
+	•	Enforce cutoff rules
+	•	Prevent infinite retries
+
+This service is invoked when:
+	•	Exception type = SYSTEM_RETRYABLE
+	•	Retry attempts are exhausted
+	•	SAF is enabled
+
+⸻
+
+6. SAF Configuration Model
+
+6.1 SAF Configuration Class
+
+public static class SafConfig {
+    private boolean enabled;
+    private int maxBackoffHours;
+    private String cutoffTime;
+}
+
+
+⸻
+
+6.2 SAF Configuration Levels
+
+SAF can be enabled at three levels:
+	1.	Workflow level
+	2.	Group (Entity) level
+	3.	Step level
+
+⸻
+
+6.3 SAF Precedence Rules (Critical)
+Step SAF Config
+   > Group SAF Config
+       > Workflow SAF Config
+
+This allows:
+	•	Global defaults
+	•	Entity-specific overrides
+	•	Step-specific behavior
+
+⸻
+
+7. SAF Execution Lifecycle
+
+7.1 Initial Event Processing
+	1.	Event arrives
+	2.	WorkflowContext created
+	3.	SAF metadata seeded
+	4.	Steps begin execution
+
+⸻
+
+7.2 During Step Execution
+
+Before executing any step:
+
+if (!safService.shouldExecute(stepName, event, context)) {
+    log.info("Skipping step due to SAF condition");
+    context.setStatus(SUCCESS);
+    return;
+}
+
+This ensures:
+	•	Deferred steps are not re-executed prematurely
+	•	Replay is controlled
+
+⸻
+
+7.3 SAF Trigger Conditions
+
+SAF is triggered when all of the following are true:
+	•	Exception type = SYSTEM_RETRYABLE
+	•	Retry count ≥ maxRetryCount
+	•	SAF is enabled (after precedence resolution)
+
+⸻
+
+8. SAF vs Retry (Clear Distinction)
+
+Retry
+SAF
+Immediate
+Deferred
+In-memory
+Persisted
+Short backoff
+Hour-based backoff
+Same execution cycle
+New execution cycle
+
+
+Retry handles transient failures
+SAF handles systemic or time-based failures
+
+⸻
+
+9. Cutoff Time Handling
+
+9.1 What Is Cutoff Time?
+
+Cutoff time defines when processing must stop for the day.
+
+Example:
+
+cutoffTime: "18:30"
+
+
+⸻
+
+9.2 Why Cutoff Time Exists
+	•	Banking windows
+	•	External dependency SLAs
+	•	Regulatory processing windows
+
+⸻
+
+9.3 SAF Behavior After Cutoff
+
+If current time > cutoffTime:
+	•	Step execution is deferred
+	•	Event is SAF-scheduled
+	•	Replay happens on the next eligible window
+
+⸻
+
+10. SAF Scheduling Logic
+
+When SAF is triggered:
+	1.	Failure reason is captured
+	2.	Retry metadata is persisted
+	3.	Next execution timestamp is calculated
+	4.	Event exits current processing safely
+
+No step after the failure executes.
+
+⸻
+
+11. SAF Replay
+
+On replay:
+	•	Event is re-loaded
+	•	Context is reconstructed
+	•	SAF rules are re-evaluated
+	•	Execution resumes deterministically
+
+Replay is idempotent and safe.
+
+⸻
+
+12. SAF + Exception Handling
+
+Only SYSTEM_RETRYABLE exceptions trigger SAF.
+
+Exception Type
+SAF Behavior
+FATAL
+No SAF
+BUSINESS_VALIDATION
+No SAF
+SYSTEM_RETRYABLE
+SAF eligible
+SKIPPABLE
+No SAF
+FLOW_HALT
+No SAF
+SILENT_WARNING
+No SAF
+
+
+⸻
+
+13. SAF Observability
+
+Each SAF decision logs:
+	•	Step name
+	•	Event ID
+	•	Retry count
+	•	Backoff hours
+	•	Cutoff decision
+	•	Failure reason
+
+This enables:
+	•	Replay debugging
+	•	Operational tracing
+	•	Compliance auditing
+
+⸻
+
+14. Example SAF Configuration (Payroll)
+
+workflow:
+  safEnabled: true
+  safConfigs:
+    maxBackoffHours: 3
+
+  groups:
+    Payroll:
+      safEnabled: true
+      safConfigs:
+        maxBackoffHours: 3
+        cutoffTime: ${payroll-app-config.options.saf-cutoff-time}
+
+
+⸻
+
+15. Example SAF Execution Scenario
+
+Scenario
+	•	Payroll reconciliation fails due to SBP outage
+	•	Retry attempts exhausted
+	•	Cutoff time not exceeded
+
+Outcome
+	•	SAF schedules retry within maxBackoffHours
+
+⸻
+
+Another Scenario
+	•	Same failure after cutoff time
+
+Outcome
+	•	SAF defers execution to next day window
+
+⸻
+
+16. How to Enable SAF for a New Step
+	1.	Set safEnabled: true
+	2.	Configure maxBackoffHours
+	3.	(Optional) Configure cutoffTime
+	4.	No code change required
+
+⸻
+
+17. Design Principles
+	•	SAF is deterministic
+	•	SAF is configuration-driven
+	•	SAF is exception-aware
+	•	SAF is time-aware
+	•	SAF never drops events
+
+⸻
+
+18. Summary
+
+The SAF framework provides:
+	•	Controlled failure recovery
+	•	Time-aware execution
+	•	Replay safety
+	•	Operational resilience
+
+It works in tandem with the Processor Framework to ensure financial-grade reliability.
+
+⸻
+
+19. Relationship to Processor Framework
+Processor Framework
+SAF
+Orchestration
+Recovery
+Step execution
+Deferred execution
+Immediate retry
+Long-term retry
+Control flow
+Time control
+
+Perfect — below is a drop-in continuation to your SAF Enablement document, written at real production depth.
+You can paste this as-is into Confluence under new sections.
+
+I’ve split it into two crisp parts:
+	1.	Real production scenarios (battle-tested cases)
+	2.	Retry vs SAF comparison table (very explicit)
+
+⸻
+
+20. Real Production SAF Scenarios
+
+This section describes actual failure modes that occur in production payroll/payment systems and how SAF behaves deterministically in each case.
+
+These are not theoretical — they map directly to your current processor + SAF code paths.
+
+⸻
+
+20.1 External System Outage (SBP / PIM Down for Hours)
+
+Scenario
+	•	Payroll processing reaches ReconcileEmployeeWithSBP
+	•	SBP API is down (HTTP 503 / timeout)
+	•	Step throws SYSTEM_RETRYABLE
+
+What Happens Internally
+	1.	Immediate retries occur (e.g., 3 attempts)
+	2.	All retries fail
+	3.	SAF is enabled for this step
+	4.	RetryScheduleService.scheduleRetry(...) is invoked
+	5.	Event is persisted with:
+	•	Failure reason
+	•	Step name
+	•	Retry count
+	•	Backoff window
+	6.	Current processing exits safely
+
+Outcome
+	•	Payroll is not cancelled
+	•	No duplicate side effects occur
+	•	Processing resumes automatically once SBP is back
+
+Why SAF Is Required Here
+
+Retry alone would:
+	•	Block threads
+	•	Spam downstream systems
+	•	Eventually fail the event
+
+SAF converts a system outage into a controlled delay.
+
+⸻
+
+20.2 Cutoff Time Breach (Banking Window Closed)
+
+Scenario
+	•	Payroll processing starts at 18:20
+	•	Cutoff time is configured as 18:30
+	•	A retryable failure occurs at 18:32
+
+What Happens Internally
+	1.	Step fails with SYSTEM_RETRYABLE
+	2.	Retry attempts exhausted
+	3.	SAF evaluates current time vs cutoff
+	4.	Cutoff exceeded → execution deferred
+	5.	SAF schedules replay for next eligible window
+
+Outcome
+	•	No processing happens outside allowed window
+	•	No partial payroll execution
+	•	Event resumes next business window
+
+Why SAF Is Required Here
+
+Retry has no concept of time windows.
+SAF enforces time-aware correctness, which is mandatory in payroll systems.
+
+⸻
+
+20.3 Partial Success + Downstream Failure
+
+Scenario
+	•	Steps executed successfully:
+	•	ReadIncomingPayrollEvent
+	•	ValidatePayrollStatusFromGusto
+	•	PersistPayrollHierarchyToDatabase
+	•	Failure occurs at SendRequestToPIM
+
+What Happens Internally
+	1.	Failure classified as SYSTEM_RETRYABLE
+	2.	Immediate retries fail
+	3.	SAF is triggered
+	4.	SAF replay resumes at the failed step
+	5.	Already completed steps are not re-executed
+
+Outcome
+	•	Database writes are not duplicated
+	•	Idempotency is preserved
+	•	PIM eventually receives request exactly once
+
+Why SAF Is Required Here
+
+Retrying the entire flow would:
+	•	Duplicate DB writes
+	•	Violate idempotency
+	•	Create reconciliation issues
+
+SAF enables step-level recovery, not full replay.
+
+⸻
+
+20.4 Long Dependency Degradation (Slow but Not Down)
+
+Scenario
+	•	External API responds intermittently
+	•	Some calls succeed, some timeout
+	•	Retries intermittently succeed
+
+What Happens Internally
+	1.	Retry attempts occur
+	2.	If retry succeeds → continue
+	3.	If retries consistently fail → SAF
+	4.	SAF smooths out instability by spacing retries
+
+Outcome
+	•	System load is controlled
+	•	External system is not overwhelmed
+	•	Payroll processing eventually completes
+
+Why SAF Is Required Here
+
+Retry alone causes:
+	•	Thundering herd
+	•	Cascading failures
+	•	CPU spikes
+
+SAF introduces backpressure into the system.
+
+⸻
+
+20.5 Same-Day SAF vs Next-Day SAF
+
+Scenario A – Same-Day
+	•	Failure occurs at 14:00
+	•	Cutoff is 18:30
+	•	maxBackoffHours = 3
+
+Outcome
+	•	SAF schedules retry at ~17:00
+	•	Processing completes same day
+
+⸻
+
+Scenario B – Next-Day
+	•	Failure occurs at 17:45
+	•	Backoff pushes execution beyond cutoff
+
+Outcome
+	•	SAF defers to next processing window
+	•	Payroll resumes next day safely
+
+⸻
+
+20.6 What SAF Explicitly Does Not Do
+
+SAF does not trigger for:
+	•	BUSINESS_VALIDATION (payroll is cancelled intentionally)
+	•	FATAL (hard stop)
+	•	SKIPPABLE (log & continue)
+	•	FLOW_HALT (intentional termination)
+
+This prevents semantic misuse of SAF.
+
+⸻
+
+21. Retry vs SAF – Comparison Table
+
+This table is designed to be very explicit for engineers and reviewers.
+
+⸻
+
+21.1 Conceptual Comparison
+Dimension
+Retry
+SAF (Store-And-Forward)
+Purpose
+Handle transient failures
+Handle prolonged / time-bound failures
+Timing
+Immediate
+Deferred
+State
+In-memory
+Persisted
+Duration
+Milliseconds–seconds
+Minutes–hours
+Thread usage
+Blocking
+Non-blocking
+Cutoff awareness
+❌ No
+✅ Yes
+Replay safety
+Limited
+Guaranteed
+Idempotency
+Risky if misused
+Safe by design
+
+
+⸻
+
+21.5 When to Use Which (Rule of Thumb)
+
+Use Retry when:
+	•	Failure is transient
+	•	Recovery is expected within seconds
+	•	No time window constraints exist
+
+Use SAF when:
+	•	Failure may last minutes/hours
+	•	Cutoff windows matter
+	•	Idempotency must be preserved
+	•	Operational control is required
+
+⸻
+
+22. Final Takeaway for Engineers
+
+Retry and SAF are not alternatives — they are complementary layers.
+
+
